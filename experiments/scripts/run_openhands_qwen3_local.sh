@@ -11,7 +11,7 @@ HOST_HOME="${HOME:-$(getent passwd "$(id -un)" | cut -d: -f6)}"
 source "${SCRIPT_DIR}/common_runtime.sh"
 
 MARS_PYTHON="${MARS_PYTHON:-$(mars_default_python "${HOST_HOME}/miniconda3/envs/mars/bin/python")}"
-OPENHANDS_PYTHON="${OPENHANDS_PYTHON:-$(mars_default_python "${HOST_HOME}/.venvs/openhands313/bin/python")}"
+OPENHANDS_PYTHON="${OPENHANDS_PYTHON:-$(mars_default_python "${HOST_HOME}/.venvs/openhands312/bin/python")}"
 OPENHANDS_RUNNER="${MARS_DIR}/experiments/openhands/run_task_workload.py"
 
 # Resources.

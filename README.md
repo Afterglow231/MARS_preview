@@ -70,8 +70,8 @@ MARS/
 
 ## Installation
 
-**Requirements:** `conda`, `git`, `cmake`, `ninja`, `torch==2.8.0+cu128`;
-datacenter-level NVIDIA GPU. Tested on H100 and H200.
+**Requirements:** `conda`, `git`, `cmake`, `ninja`, `python>=3.12`,
+`torch==2.8.0+cu128`; Datacenter-level NVIDIA GPU. Tested on H100 and H200.
 
 ```bash
 # Clone the repository and enter the repo root.
@@ -107,15 +107,20 @@ PY
 
 # Create the OpenHands worker environment.
 # The vLLM service runs in conda env `mars`; OpenHands workers use this venv.
-python3.13 -m venv ~/.venvs/openhands313
-~/.venvs/openhands313/bin/python -m pip install --upgrade pip
-~/.venvs/openhands313/bin/python -m pip install \
+# OpenHands 1.14 requires Python >=3.12. These commands use python3.12 because
+# python3.13 is not installed by default on many servers; override as needed.
+OPENHANDS_VENV="${OPENHANDS_VENV:-$HOME/.venvs/openhands312}"
+OPENHANDS_VENV_PYTHON="${OPENHANDS_VENV_PYTHON:-python3.12}"
+"$OPENHANDS_VENV_PYTHON" -m venv "$OPENHANDS_VENV"
+"$OPENHANDS_VENV/bin/python" -m pip install --upgrade pip
+"$OPENHANDS_VENV/bin/python" -m pip install \
   openhands-sdk==1.14.0 \
   openhands-tools==1.14.0 \
   litellm==1.82.3
+export OPENHANDS_PYTHON="$OPENHANDS_VENV/bin/python"
 
 # Verify the OpenHands runtime.
-OPENHANDS_SUPPRESS_BANNER=1 ~/.venvs/openhands313/bin/python - <<'PY'
+OPENHANDS_SUPPRESS_BANNER=1 "$OPENHANDS_PYTHON" - <<'PY'
 from openhands.sdk import Agent, Conversation, LLM, Tool
 from openhands.tools.terminal import TerminalTool
 from openhands.tools.file_editor import FileEditorTool
