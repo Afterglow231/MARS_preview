@@ -188,7 +188,7 @@ python -m pip install --isolated --no-cache-dir \
   -r requirements/cuda.txt
 
 echo "[4/5] Installing repo + experiment deps..."
-python -m pip install lmcache hf_transfer requests pytest
+python -m pip install lmcache==0.4.4 hf_transfer requests pytest
 if [[ -d mini-swe-agent ]]; then
   python -m pip install -e mini-swe-agent
   python -m pip install datasets

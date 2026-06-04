@@ -231,6 +231,12 @@ GPU=0 POLICIES="fcfs mars" TARGETS="vllm openhands" \
 : Create the OpenHands environment above or pass
   `OPENHANDS_PYTHON=/path/to/openhands/python`.
 
+`AttributeError: Qwen2Tokenizer has no attribute all_special_tokens_extended`
+
+: The `mars` environment resolved an incompatible tokenizer stack. Reinstall
+  the tested versions with
+  `python -m pip install transformers==4.55.2 tokenizers==0.21.1 huggingface-hub==0.36.2 lmcache==0.4.4`.
+
 `Model path not found`
 
 : Download or mount the model locally and set `MODEL_PATH=/path/to/model`.
