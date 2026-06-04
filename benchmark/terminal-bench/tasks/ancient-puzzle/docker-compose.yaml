@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  ancient-puzzle:
+    image: python:3.9-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: bash -c "python decode_and_decrypt.py"

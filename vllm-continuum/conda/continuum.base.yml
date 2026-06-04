@@ -1,0 +1,16 @@
+name: mars
+channels:
+  - conda-forge
+dependencies:
+  # MARS experiment scripts and the vLLM fork are tested with Python 3.10.
+  # Pin CPython to avoid GraalPy/PyPy (PyTorch wheels require CPython).
+  - python=3.10.*=*cpython*
+  - pip
+  # Build/runtime helpers (vLLM uses CMake/Ninja; even with precompiled .so,
+  # these are useful for some deps and for future source builds).
+  - cmake>=3.26.1
+  - ninja
+  - git
+  - pkg-config
+  - wheel
+  - setuptools

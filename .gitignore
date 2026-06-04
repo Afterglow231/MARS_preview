@@ -1,0 +1,53 @@
+# --- 通用 ---
+.DS_Store
+*.swp
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# 日志
+*.log
+
+# --- 训练/模型/编译产物（通常不上传） ---
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+*.so
+*.o
+*.a
+/build/
+/dist/
+/*.egg-info/
+
+# --- 本地数据/输出 ---
+outputs/
+backup/
+experiments/**/outputs/
+experiments/replay/record_workspaces/
+experiments/replay/record_tool_venvs/
+experiments/replay/*.jsonl
+experiments/replay/scheduler_timestamps*
+
+# 大体量外部 benchmark 数据按需下载，不随源码提交。
+# 已随 clean 版保留的 benchmark/hybrid_workloads/test_workload.jsonl、
+# benchmark/GitTaskBench 和 benchmark/terminal-bench 不在这里忽略。
+benchmark/datasets/
+benchmark/gaia/
+benchmark/SWE-rebench-openhands-trajectories/
+benchmark/replay_*.jsonl
+benchmark/replay_*.json
+benchmark/berkeley-fc/
+benchmark/humaneval/
+benchmark/swe-agent/
+benchmark/swe-bench/
+
+# vllm-continuum 里的依赖/产物（按需保留/删除）
+vllm-continuum/.deps/
+vllm-continuum/swebench_output/
+vllm-continuum/vllm/vllm_flash_attn/*.so

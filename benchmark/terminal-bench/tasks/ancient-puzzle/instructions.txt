@@ -1,0 +1,7 @@
+Instructions for decoding the ancient tablet:
+1. The tablet contains a cipher using the alphabet
+2. Use scroll1.txt to map letters to numbers
+3. Use scroll2.txt to apply weights to the letter values
+4. Combine the weighted values to form the incantation
+5. Send the incantation to http://decryptor:8090
+6. The final message will be written to /app/results.txt

@@ -1,0 +1,1 @@
+{"task_id": "git-multibranch", "task_dir": "benchmark/terminal-bench/tasks/git-multibranch", "parser_name": "pytest", "category": "system-administration", "difficulty": "medium", "max_agent_timeout_sec": 900.0, "max_test_timeout_sec": 180.0}

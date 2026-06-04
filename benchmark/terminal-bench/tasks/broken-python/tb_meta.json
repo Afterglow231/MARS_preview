@@ -1,0 +1,1 @@
+{"task_id": "broken-python", "task_dir": "benchmark/terminal-bench/tasks/broken-python", "parser_name": "pytest", "category": "software-engineering", "difficulty": "easy", "max_agent_timeout_sec": 900.0, "max_test_timeout_sec": 180.0}
