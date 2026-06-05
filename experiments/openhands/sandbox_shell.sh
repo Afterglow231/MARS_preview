@@ -8,6 +8,7 @@ host_home="${MARS_HOST_HOME:-}"
 host_conda_root="${MARS_HOST_CONDA_ROOT:-}"
 host_venvs_root="${MARS_HOST_VENVS_ROOT:-}"
 host_models_root="${MARS_HOST_MODELS_ROOT:-}"
+local_inputs_dir="${MARS_LOCAL_INPUTS_DIR:-}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 guard_source_py="${script_dir}/command_guard.py"
 guard_runtime_py="${runtime}/command_guard.py"
@@ -102,6 +103,9 @@ fi
 if [[ -n "$host_models_root" ]]; then
   collect_parent_dirs "$host_models_root"
 fi
+if [[ -n "$local_inputs_dir" ]]; then
+  collect_parent_dirs "$local_inputs_dir"
+fi
 
 bwrap_args=(
   --die-with-parent
@@ -136,6 +140,7 @@ bwrap_args+=(
   --setenv XDG_STATE_HOME "$state_dir"
   --setenv MARS_WORKSPACE_DIR "$workspace"
   --setenv MARS_RUNTIME_DIR "$runtime"
+  --setenv MARS_LOCAL_INPUTS_DIR "$local_inputs_dir"
 )
 
 if [[ -n "$host_conda_root" && -d "$host_conda_root" ]]; then
@@ -144,7 +149,11 @@ fi
 if [[ -n "$host_venvs_root" && -d "$host_venvs_root" ]]; then
   bwrap_args+=(--ro-bind "$host_venvs_root" "$host_venvs_root")
 fi
-if [[ -n "$host_models_root" && -d "$host_models_root" ]]; then
+if [[ -n "$local_inputs_dir" && -d "$local_inputs_dir" ]]; then
+  bwrap_args+=(--ro-bind "$local_inputs_dir" "$local_inputs_dir")
+fi
+
+if [[ -n "$host_models_root" && -d "$host_models_root" && "${MARS_ALLOW_HOST_MODELS_READ:-0}" == "1" ]]; then
   bwrap_args+=(--ro-bind "$host_models_root" "$host_models_root")
 fi
 
@@ -156,6 +165,11 @@ if /usr/bin/bwrap \
   --proc /proc \
   /bin/true >/dev/null 2>&1; then
   exec /usr/bin/bwrap "${bwrap_args[@]}" /usr/bin/env BASH_ENV="$guard_runtime_rc" /bin/bash --noprofile --rcfile "$guard_runtime_rc" "$@"
+fi
+
+if [[ "${MARS_REQUIRE_BWRAP:-1}" == "1" ]]; then
+  echo "MARS OpenHands sandbox requires working bubblewrap isolation. Set MARS_REQUIRE_BWRAP=0 only for debugging." >&2
+  exit 126
 fi
 
 exec /usr/bin/env BASH_ENV="$guard_runtime_rc" /bin/bash --noprofile --rcfile "$guard_runtime_rc" "$@"

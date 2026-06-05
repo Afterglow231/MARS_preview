@@ -10,7 +10,12 @@ from pathlib import Path
 SHELL_SCRIPT = Path(__file__).resolve().with_name("sandbox_shell.sh")
 
 
-def _run_guarded_shell(base_dir: Path, command: str) -> subprocess.CompletedProcess[str]:
+def _run_guarded_shell(
+    base_dir: Path,
+    command: str,
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     workspace = base_dir / "workspace"
     runtime = workspace / ".mars_runtime"
     home_dir = runtime / "home"
@@ -25,8 +30,11 @@ def _run_guarded_shell(base_dir: Path, command: str) -> subprocess.CompletedProc
             "MARS_HOST_CONDA_ROOT": "",
             "MARS_HOST_VENVS_ROOT": "",
             "MARS_HOST_MODELS_ROOT": "",
+            "MARS_LOCAL_INPUTS_DIR": "",
         }
     )
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [str(SHELL_SCRIPT), "-lc", command],
         cwd=workspace,
@@ -51,6 +59,30 @@ class SandboxShellTest(unittest.TestCase):
             proc = _run_guarded_shell(Path(tmp), "printf ok")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "ok")
+
+    def test_exposes_local_inputs_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            local_inputs = base / "out" / "_localized_inputs"
+            local_inputs.mkdir(parents=True)
+            asset = local_inputs / "asset.txt"
+            asset.write_text("input\n", encoding="utf-8")
+
+            read_proc = _run_guarded_shell(
+                base,
+                'cat "$MARS_LOCAL_INPUTS_DIR/asset.txt"',
+                extra_env={"MARS_LOCAL_INPUTS_DIR": str(local_inputs)},
+            )
+            self.assertEqual(read_proc.returncode, 0, read_proc.stderr)
+            self.assertEqual(read_proc.stdout, "input\n")
+
+            write_proc = _run_guarded_shell(
+                base,
+                'printf changed > "$MARS_LOCAL_INPUTS_DIR/asset.txt"',
+                extra_env={"MARS_LOCAL_INPUTS_DIR": str(local_inputs)},
+            )
+            self.assertNotEqual(write_proc.returncode, 0)
+            self.assertEqual(asset.read_text(encoding="utf-8"), "input\n")
 
 
 if __name__ == "__main__":

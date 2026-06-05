@@ -10,20 +10,6 @@ from typing import Any
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 
-try:
-    from pydantic import SecretStr
-
-    from openhands.sdk import Agent, Conversation, LLM, Tool
-    from openhands.tools.file_editor import FileEditorTool
-    from openhands.tools.preset.default import register_default_tools
-    from openhands.tools.task_tracker import TaskTrackerTool
-    from openhands.tools.terminal import TerminalTool
-except ModuleNotFoundError as exc: 
-    raise RuntimeError(
-        "OpenHands SDK is not installed in the current Python environment. "
-        "Use the dedicated OpenHands Python environment to run this runner."
-    ) from exc
-
 from common import now_s
 from llm_trace_bridge import install_llm_trace_patch, register_llm_collector, unregister_llm_collector
 from request_bootstrap import (
@@ -39,7 +25,34 @@ from trace_writer import RequestTraceCollector
 MAX_VERIFICATION_NUDGES = 1
 RUNTIME_DIR_NAME = ".mars_runtime"
 SANDBOX_SHELL_PATH = Path(__file__).with_name("sandbox_shell.sh")
-HOST_HOME = Path.home().resolve()
+HOST_HOME = Path(os.environ.get("MARS_HOST_HOME") or Path.home()).expanduser().resolve()
+
+
+def _load_openhands_sdk() -> dict[str, Any]:
+    try:
+        from pydantic import SecretStr
+
+        from openhands.sdk import Agent, Conversation, LLM, Tool
+        from openhands.tools.file_editor import FileEditorTool
+        from openhands.tools.preset.default import register_default_tools
+        from openhands.tools.task_tracker import TaskTrackerTool
+        from openhands.tools.terminal import TerminalTool
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "OpenHands SDK is not installed in the current Python environment. "
+            "Use the dedicated OpenHands Python environment to run this runner."
+        ) from exc
+    return {
+        "Agent": Agent,
+        "Conversation": Conversation,
+        "FileEditorTool": FileEditorTool,
+        "LLM": LLM,
+        "SecretStr": SecretStr,
+        "TaskTrackerTool": TaskTrackerTool,
+        "TerminalTool": TerminalTool,
+        "Tool": Tool,
+        "register_default_tools": register_default_tools,
+    }
 
 
 # Runtime configuration used to construct one OpenHands conversation.
@@ -67,7 +80,12 @@ def _normalize_openai_compatible_model(model: str) -> str:
     return f"openai/{text}"
 
 
-def _build_tools(config: OpenHandsConfig) -> list[Tool]:
+def _build_tools(config: OpenHandsConfig, sdk: dict[str, Any]) -> list[Any]:
+    Tool = sdk["Tool"]
+    TerminalTool = sdk["TerminalTool"]
+    FileEditorTool = sdk["FileEditorTool"]
+    TaskTrackerTool = sdk["TaskTrackerTool"]
+
     terminal_params: dict[str, Any] = {}
     if config.terminal_no_change_timeout_s is not None:
         terminal_params["no_change_timeout_seconds"] = int(config.terminal_no_change_timeout_s)
@@ -176,6 +194,7 @@ def _apply_workspace_runtime_env(workspace_dir: Path) -> dict[str, str]:
         "MARS_HOST_CONDA_ROOT": host_conda_root,
         "MARS_HOST_VENVS_ROOT": host_venvs_root,
         "MARS_HOST_MODELS_ROOT": host_models_root,
+        "MARS_LOCAL_INPUTS_DIR": os.environ.get("MARS_LOCAL_INPUTS_DIR", ""),
     }
     for key, value in env_updates.items():
         os.environ[key] = value
@@ -196,14 +215,22 @@ def run_task_request(
     events: Any,
 ) -> dict[str, Any]:
     # Run OpenHands requests with full tool chain & trace record
+    workspace_dir = (workspace_root / request_id).resolve()
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    runtime_env = _apply_workspace_runtime_env(workspace_dir)
+    sdk = _load_openhands_sdk()
+    Agent = sdk["Agent"]
+    Conversation = sdk["Conversation"]
+    LLM = sdk["LLM"]
+    SecretStr = sdk["SecretStr"]
+    register_default_tools = sdk["register_default_tools"]
+
     install_llm_trace_patch()
     register_default_tools(enable_browser=False)
 
     dataset_request_id = task.get("request_id")
     benchmark = task.get("benchmark")
     task_id = task.get("task_id")
-    workspace_dir = (workspace_root / request_id).resolve()
-    workspace_dir.mkdir(parents=True, exist_ok=True)
 
     collector = RequestTraceCollector(
         events=events,
@@ -217,7 +244,6 @@ def run_task_request(
     collector.mark_worker_start()
     file_count = materialize_workspace_init(task, workspace_dir)
     collector.set_workspace_materialized(file_count)
-    runtime_env = _apply_workspace_runtime_env(workspace_dir)
 
     llm = LLM(
         model=_normalize_openai_compatible_model(config.model),
@@ -255,7 +281,7 @@ def run_task_request(
     try:
         agent = Agent(
             llm=llm,
-            tools=_build_tools(config),
+            tools=_build_tools(config, sdk),
             system_prompt_kwargs={"cli_mode": True},
             condenser=None,
         )

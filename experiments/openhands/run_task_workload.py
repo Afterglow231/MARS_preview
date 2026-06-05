@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import errno
 import faulthandler
+import hashlib
 import json
 import math
 import os
@@ -47,6 +48,11 @@ LOCAL_RUNTIME_BUNDLE_FILES = (
     "tool_trace_bridge.py",
     "trace_writer.py",
 )
+LOCAL_INPUT_PATH_KEYS = {
+    "groundtruth_path",
+    "repo_cache_path",
+    "src_path",
+}
 
 
 def _safe_print(*args: Any, **kwargs: Any) -> None:
@@ -77,6 +83,16 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Per-request workspaces root. Defaults to <out-dir>/workspaces.",
+    )
+    ap.add_argument(
+        "--allow-workspace-outside-out-dir",
+        action="store_true",
+        help="Allow --workspace-root outside --out-dir. Disabled by default for strict local isolation.",
+    )
+    ap.add_argument(
+        "--no-localize-task-inputs",
+        action="store_true",
+        help="Do not copy local task input paths into <out-dir>/_localized_inputs.",
     )
     ap.add_argument("--model", type=str, required=True, help="Model name served by the vLLM endpoint.")
     ap.add_argument("--base-url", type=str, required=True, help="OpenAI-compatible vLLM base URL.")
@@ -196,6 +212,234 @@ def _prepare_tasks(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.max_requests is not None:
         tasks = tasks[: args.max_requests]
     return tasks
+
+
+def _is_within_path(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _require_path_under(path: Path, root: Path, *, label: str) -> None:
+    path_r = path.resolve(strict=False)
+    root_r = root.resolve(strict=False)
+    if path_r == root_r or _is_within_path(path_r, root_r):
+        return
+    raise SystemExit(
+        f"{label} must be inside out_dir for strict OpenHands isolation: "
+        f"{path_r} is outside {root_r}. "
+        "Use --allow-workspace-outside-out-dir only for explicit debugging."
+    )
+
+
+def _looks_like_url(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        "://" in stripped
+        or stripped.startswith("git@")
+        or stripped.startswith("ssh:")
+    )
+
+
+def _expand_existing_local_path(value: str) -> Path | None:
+    text = str(value).strip()
+    if not text or _looks_like_url(text):
+        return None
+    expanded = os.path.expandvars(os.path.expanduser(text))
+    path = Path(expanded)
+    if not path.is_absolute():
+        return None
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception:
+        resolved = path
+    if not resolved.exists():
+        return None
+    return resolved
+
+
+def _localized_input_name(src: Path) -> str:
+    digest = hashlib.sha1(str(src).encode("utf-8")).hexdigest()[:16]
+    name = src.name or "input"
+    safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
+    return f"{digest}_{safe_name}"
+
+
+def _assert_no_symlink_escape(root: Path) -> None:
+    if not root.exists():
+        return
+    root_r = root.resolve(strict=False)
+    paths = [root]
+    if root.is_dir():
+        paths.extend(root.rglob("*"))
+    for path in paths:
+        if not path.is_symlink():
+            continue
+        try:
+            target = path.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ValueError(f"Localized input contains dangling symlink: {path}") from exc
+        if not _is_within_path(target, root_r):
+            raise ValueError(
+                f"Localized input symlink escapes its copied root: {path} -> {target}"
+            )
+
+
+def _copy_local_input(src: Path, local_inputs_dir: Path, path_map: dict[str, str]) -> str:
+    src_r = src.resolve(strict=True)
+    key = str(src_r)
+    existing = path_map.get(key)
+    if existing:
+        return existing
+
+    local_inputs_r = local_inputs_dir.resolve(strict=False)
+    if src_r == local_inputs_r or _is_within_path(src_r, local_inputs_r):
+        localized = str(src_r)
+        path_map[key] = localized
+        return localized
+
+    dst = local_inputs_dir / "paths" / _localized_input_name(src_r)
+    if not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_name(dst.name + ".tmp")
+        if tmp.exists():
+            if tmp.is_dir() and not tmp.is_symlink():
+                shutil.rmtree(tmp, ignore_errors=True)
+            else:
+                tmp.unlink(missing_ok=True)
+        try:
+            if src_r.is_dir():
+                shutil.copytree(src_r, tmp, symlinks=True)
+            else:
+                tmp.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_r, tmp)
+            _assert_no_symlink_escape(tmp)
+            tmp.replace(dst)
+        except Exception:
+            if tmp.exists():
+                if tmp.is_dir() and not tmp.is_symlink():
+                    shutil.rmtree(tmp, ignore_errors=True)
+                else:
+                    tmp.unlink(missing_ok=True)
+            raise
+    _assert_no_symlink_escape(dst)
+    localized = str(dst.resolve(strict=False))
+    path_map[key] = localized
+    return localized
+
+
+def _rewrite_local_input_paths(
+    obj: Any,
+    *,
+    local_inputs_dir: Path,
+    path_map: dict[str, str],
+    stats: dict[str, int],
+) -> Any:
+    if isinstance(obj, list):
+        return [
+            _rewrite_local_input_paths(
+                item,
+                local_inputs_dir=local_inputs_dir,
+                path_map=path_map,
+                stats=stats,
+            )
+            for item in obj
+        ]
+    if not isinstance(obj, dict):
+        return obj
+
+    rewritten: dict[str, Any] = {}
+    for key, value in obj.items():
+        if key in LOCAL_INPUT_PATH_KEYS and isinstance(value, str):
+            src = _expand_existing_local_path(value)
+            if src is not None:
+                localized = _copy_local_input(src, local_inputs_dir, path_map)
+                if localized != value:
+                    stats["rewritten_paths"] = int(stats.get("rewritten_paths", 0)) + 1
+                rewritten[key] = localized
+                continue
+        rewritten[key] = _rewrite_local_input_paths(
+            value,
+            local_inputs_dir=local_inputs_dir,
+            path_map=path_map,
+            stats=stats,
+        )
+    return rewritten
+
+
+def _rewrite_workspace_init_content(
+    content: str,
+    *,
+    local_inputs_dir: Path,
+    path_map: dict[str, str],
+    stats: dict[str, int],
+) -> str:
+    try:
+        parsed = json.loads(content)
+    except Exception:
+        return content
+    if not isinstance(parsed, (dict, list)):
+        return content
+    rewritten = _rewrite_local_input_paths(
+        parsed,
+        local_inputs_dir=local_inputs_dir,
+        path_map=path_map,
+        stats=stats,
+    )
+    if rewritten == parsed:
+        return content
+    stats["rewritten_workspace_init_files"] = (
+        int(stats.get("rewritten_workspace_init_files", 0)) + 1
+    )
+    return json.dumps(rewritten, ensure_ascii=False, indent=2) + "\n"
+
+
+def _localize_task_inputs(
+    tasks: list[dict[str, Any]],
+    *,
+    local_inputs_dir: Path,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    path_map: dict[str, str] = {}
+    stats: dict[str, int] = {
+        "rewritten_paths": 0,
+        "rewritten_workspace_init_files": 0,
+        "unique_copied_paths": 0,
+    }
+    localized_tasks: list[dict[str, Any]] = []
+
+    for task in tasks:
+        rewritten_task = _rewrite_local_input_paths(
+            task,
+            local_inputs_dir=local_inputs_dir,
+            path_map=path_map,
+            stats=stats,
+        )
+        workspace_init = rewritten_task.get("workspace_init")
+        if isinstance(workspace_init, list):
+            new_workspace_init: list[Any] = []
+            for item in workspace_init:
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("content"), str)
+                ):
+                    new_item = dict(item)
+                    new_item["content"] = _rewrite_workspace_init_content(
+                        str(item["content"]),
+                        local_inputs_dir=local_inputs_dir,
+                        path_map=path_map,
+                        stats=stats,
+                    )
+                    new_workspace_init.append(new_item)
+                else:
+                    new_workspace_init.append(item)
+            rewritten_task = dict(rewritten_task)
+            rewritten_task["workspace_init"] = new_workspace_init
+        localized_tasks.append(rewritten_task)
+
+    stats["unique_copied_paths"] = len(path_map)
+    return localized_tasks, stats
 
 
 @dataclass(frozen=True)
@@ -591,6 +835,15 @@ def _run_request_subprocess(
         cmd.extend(["--terminal-type", str(args.terminal_type)])
 
     env = os.environ.copy()
+    host_home = env.get("MARS_HOST_HOME") or str(Path.home().resolve())
+    env["MARS_HOST_HOME"] = host_home
+    env.setdefault("MARS_HOST_CONDA_ROOT", str(Path(host_home) / "miniconda3"))
+    env.setdefault("MARS_HOST_VENVS_ROOT", str(Path(host_home) / ".venvs"))
+    env.setdefault("MARS_HOST_MODELS_ROOT", str(Path(host_home) / "models"))
+    if getattr(args, "local_inputs_dir", None):
+        env["MARS_LOCAL_INPUTS_DIR"] = str(args.local_inputs_dir)
+    env.setdefault("MARS_REQUIRE_BWRAP", "1")
+    env.setdefault("MARS_ALLOW_HOST_MODELS_READ", "0")
     runtime_pythonpath = str(runtime_bundle_dir)
     if env.get("PYTHONPATH"):
         env["PYTHONPATH"] = runtime_pythonpath + os.pathsep + env["PYTHONPATH"]
@@ -668,6 +921,7 @@ def _run_request_subprocess(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
+        cwd=str(request_run_dir),
         start_new_session=True,
     )
     timed_out = False
@@ -828,13 +1082,38 @@ def main() -> None:
         if args.workspace_root
         else (out_dir / "workspaces").resolve()
     )
+    if not args.allow_workspace_outside_out_dir:
+        _require_path_under(workspace_root, out_dir, label="workspace_root")
     out_dir.mkdir(parents=True, exist_ok=True)
     workspace_root.mkdir(parents=True, exist_ok=True)
+    local_inputs_dir = (out_dir / "_localized_inputs").resolve()
+    local_inputs_dir.mkdir(parents=True, exist_ok=True)
+    setattr(args, "local_inputs_dir", str(local_inputs_dir))
+    os.environ["MARS_LOCAL_INPUTS_DIR"] = str(local_inputs_dir)
     request_runs_root = (out_dir / "_request_runs").resolve()
     request_runs_root.mkdir(parents=True, exist_ok=True)
     runtime_bundle_dir = _prepare_local_runtime_bundle(out_dir)
 
     tasks = _prepare_tasks(args)
+    input_localization_stats = {
+        "rewritten_paths": 0,
+        "rewritten_workspace_init_files": 0,
+        "unique_copied_paths": 0,
+    }
+    if not args.no_localize_task_inputs:
+        tasks, input_localization_stats = _localize_task_inputs(
+            tasks,
+            local_inputs_dir=local_inputs_dir,
+        )
+    _safe_print(
+        "[input_localization] "
+        f"enabled={not bool(args.no_localize_task_inputs)} "
+        f"dir={local_inputs_dir} "
+        f"unique_copied_paths={input_localization_stats['unique_copied_paths']} "
+        f"rewritten_paths={input_localization_stats['rewritten_paths']} "
+        f"rewritten_workspace_init_files={input_localization_stats['rewritten_workspace_init_files']}",
+        flush=True,
+    )
     effective_max_workers = max(
         1,
         len(tasks) if args.max_workers <= 0 else min(args.max_workers, len(tasks)),
@@ -846,6 +1125,11 @@ def main() -> None:
             "tasks": str(tasks_path),
             "out_dir": str(out_dir),
             "workspace_root": str(workspace_root),
+            "local_inputs_dir": str(local_inputs_dir),
+            "input_localization": {
+                "enabled": not bool(args.no_localize_task_inputs),
+                **input_localization_stats,
+            },
             "config": {
                 "model": args.model,
                 "base_url": args.base_url,
@@ -894,6 +1178,8 @@ def main() -> None:
                 "mars_no_kv_active_limit": args.mars_no_kv_active_limit,
                 "prefill_tokenizer": args.prefill_tokenizer,
                 "openhands_python": str(Path(args.openhands_python).expanduser()),
+                "allow_workspace_outside_out_dir": bool(args.allow_workspace_outside_out_dir),
+                "localize_task_inputs": not bool(args.no_localize_task_inputs),
                 "browser_enabled": False,
                 "wait_semantics": "request_queue_wait + OpenHands native tool dispatch wait",
             },
@@ -927,6 +1213,12 @@ def main() -> None:
         "effective_max_workers": effective_max_workers,
         "cpu_affinity": args.cpu_affinity,
         "out_dir": str(out_dir),
+        "workspace_root": str(workspace_root),
+        "local_inputs_dir": str(local_inputs_dir),
+        "input_localization": {
+            "enabled": not bool(args.no_localize_task_inputs),
+            **input_localization_stats,
+        },
         "scheduling_policy": args.scheduling_policy,
         "runtime_bundle_dir": str(runtime_bundle_dir),
         "kv_events": bool(args.kv_events),

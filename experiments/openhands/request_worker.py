@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 from common import JSONLWriter
-from openhands_runner import OpenHandsConfig, run_task_request
 
 
 class BufferedEventsWriter:
@@ -54,8 +54,47 @@ def _parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def _prepare_early_worker_env(workspace_root: Path, request_id: str) -> None:
+    workspace_dir = (workspace_root / request_id).resolve()
+    runtime_root = workspace_dir / ".mars_runtime" / "worker"
+    dirs = {
+        "home": runtime_root / "home",
+        "tmp": runtime_root / "tmp",
+        "cache": runtime_root / "cache",
+        "config": runtime_root / "config",
+        "data": runtime_root / "data",
+        "state": runtime_root / "state",
+        "pycache": runtime_root / "pycache",
+    }
+    for path in dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+
+    host_home = os.environ.get("MARS_HOST_HOME") or str(Path.home().resolve())
+    os.environ["MARS_HOST_HOME"] = host_home
+    os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
+    os.environ.update(
+        {
+            "HOME": str(dirs["home"]),
+            "TMPDIR": str(dirs["tmp"]),
+            "TMP": str(dirs["tmp"]),
+            "TEMP": str(dirs["tmp"]),
+            "XDG_CACHE_HOME": str(dirs["cache"]),
+            "XDG_CONFIG_HOME": str(dirs["config"]),
+            "XDG_DATA_HOME": str(dirs["data"]),
+            "XDG_STATE_HOME": str(dirs["state"]),
+            "PYTHONPYCACHEPREFIX": str(dirs["pycache"]),
+            "PYTHONNOUSERSITE": "1",
+        }
+    )
+
+
 def main() -> None:
     args = _parse_args()
+    workspace_root = Path(args.workspace_root).expanduser().resolve()
+    _prepare_early_worker_env(workspace_root, args.request_id)
+
+    from openhands_runner import OpenHandsConfig, run_task_request
+
     task = json.loads(Path(args.task_json).read_text(encoding="utf-8"))
     live_events_path = (
         Path(args.live_events_path).expanduser().resolve()
@@ -81,7 +120,7 @@ def main() -> None:
         task=task,
         request_id=args.request_id,
         arrival_time_s=args.arrival_time_s,
-        workspace_root=Path(args.workspace_root).expanduser().resolve(),
+        workspace_root=workspace_root,
         events=writer,
     )
     result_path = Path(args.result_json).expanduser().resolve()
