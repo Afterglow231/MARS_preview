@@ -288,7 +288,9 @@ check_local_vllm_slot() {
   if ! mars_bool_true "${ALLOW_CONCURRENT_RUNS}"; then
     local pids
     pids="$(existing_guarded_run_pids)"
-    [[ -n "${pids}" ]] && die "Another OpenHands/vLLM run is active on GPU(s) [${GPU_GUARD_DEVICES}] (PID(s): ${pids}). Set ALLOW_CONCURRENT_RUNS=1 to bypass."
+    if [[ -n "${pids}" ]]; then
+      die "Another OpenHands/vLLM run is active on GPU(s) [${GPU_GUARD_DEVICES}] (PID(s): ${pids}). Set ALLOW_CONCURRENT_RUNS=1 to bypass."
+    fi
   fi
 }
 
