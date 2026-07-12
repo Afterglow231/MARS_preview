@@ -10,8 +10,22 @@ MARS_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 HOST_HOME="${HOME:-$(getent passwd "$(id -un)" | cut -d: -f6)}"
 source "${SCRIPT_DIR}/common_runtime.sh"
 
-MARS_PYTHON="${MARS_PYTHON:-$(mars_default_python "${HOST_HOME}/miniconda3/envs/mars/bin/python")}"
-OPENHANDS_PYTHON="${OPENHANDS_PYTHON:-$(mars_default_python "${HOST_HOME}/.venvs/openhands312/bin/python")}"
+default_openhands_python() {
+  local candidate
+  for candidate in \
+    "${HOST_HOME}/.venvs/openhands313/bin/python" \
+    "${HOST_HOME}/.venvs/openhands312/bin/python" \
+    "${HOST_HOME}/.archived_venvs"/openhands313*/bin/python; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  printf '%s\n' "${HOST_HOME}/.venvs/openhands313/bin/python"
+}
+
+MARS_PYTHON="${MARS_PYTHON:-$(mars_default_python "${HOST_HOME}/miniconda3/envs/mas/bin/python")}"
+OPENHANDS_PYTHON="${OPENHANDS_PYTHON:-$(default_openhands_python)}"
 OPENHANDS_RUNNER="${MARS_DIR}/experiments/openhands/run_task_workload.py"
 
 # Resources.
@@ -183,6 +197,13 @@ existing_guarded_run_pids() {
 preflight() {
   [[ -x "${MARS_PYTHON}" ]] || die "MARS_PYTHON not found or not executable: ${MARS_PYTHON}"
   [[ -x "${OPENHANDS_PYTHON}" ]] || die "OPENHANDS_PYTHON not found or not executable: ${OPENHANDS_PYTHON}"
+  if ! "${OPENHANDS_PYTHON}" - <<'PY' >/dev/null 2>&1
+import openhands.sdk  # noqa: F401
+import pydantic  # noqa: F401
+PY
+  then
+    die "OPENHANDS_PYTHON cannot import openhands.sdk and pydantic: ${OPENHANDS_PYTHON}"
+  fi
   [[ -f "${OPENHANDS_RUNNER}" ]] || die "OpenHands workload runner not found: ${OPENHANDS_RUNNER}"
   [[ -f "${TASKS_PATH}" ]] || die "Tasks file not found: ${TASKS_PATH}"
 
@@ -330,6 +351,61 @@ start_local_vllm() {
     launch_cmd+=(taskset -c "${CPU_CORES}")
   fi
   launch_cmd+=("${VLLM_CMD[@]}")
+
+  if mars_bool_true "${VLLM_NCU_PROFILE:-0}"; then
+    local ncu_exe="${NCU_BIN:-/opt/nvidia/nsight-compute/2025.4.1/ncu}"
+    if [[ ! -x "${ncu_exe}" ]]; then
+      if command -v "${ncu_exe}" >/dev/null 2>&1; then
+        ncu_exe="$(command -v "${ncu_exe}")"
+      else
+        die "VLLM_NCU_PROFILE=1 but NCU_BIN=${ncu_exe} is not executable/on PATH"
+      fi
+    fi
+    [[ -n "${VLLM_NCU_OUTPUT_PREFIX:-}" ]] || die "VLLM_NCU_PROFILE=1 requires VLLM_NCU_OUTPUT_PREFIX"
+
+    echo "== Profiling local vLLM with NCU =="
+    log_kv VLLM_NCU_OUTPUT_PREFIX "${VLLM_NCU_OUTPUT_PREFIX}"
+    log_kv NCU_FORWARD_MODE "${NCU_FORWARD_MODE:-pd_mixed}"
+    log_kv NCU_NVTX_INCLUDE "${NCU_NVTX_INCLUDE:-regex:vllm_forward_step.*mode=${NCU_FORWARD_MODE:-pd_mixed}.*/}"
+    log_kv NCU_LAUNCH_SKIP "${NCU_LAUNCH_SKIP:-0}"
+    log_kv NCU_LAUNCH_COUNT "${NCU_LAUNCH_COUNT:-20}"
+
+    local ncu_cmd=(
+      "${ncu_exe}"
+      --force-overwrite
+      --target-processes all
+      --kernel-name-base demangled
+      --replay-mode "${NCU_REPLAY_MODE:-kernel}"
+      --null-stdin
+      --nvtx
+      --nvtx-include "${NCU_NVTX_INCLUDE:-regex:vllm_forward_step.*mode=${NCU_FORWARD_MODE:-pd_mixed}.*/}"
+      --launch-skip "${NCU_LAUNCH_SKIP:-0}"
+      --launch-count "${NCU_LAUNCH_COUNT:-20}"
+      -o "${VLLM_NCU_OUTPUT_PREFIX}"
+    )
+    if mars_bool_true "${VLLM_NCU_KILL_AFTER_PROFILE:-0}"; then
+      ncu_cmd+=(--kill 1)
+    fi
+    if [[ -n "${NCU_KERNEL_NAME:-}" ]]; then
+      ncu_cmd+=(--kernel-name "${NCU_KERNEL_NAME}")
+    fi
+
+    local section
+    local ncu_sections
+    IFS=',' read -r -a ncu_sections <<< "${NCU_SECTIONS:-SpeedOfLight,SpeedOfLight_RooflineChart,SpeedOfLight_HierarchicalTensorRooflineChart,ComputeWorkloadAnalysis,MemoryWorkloadAnalysis,MemoryWorkloadAnalysis_Chart,MemoryWorkloadAnalysis_Tables,Occupancy,SchedulerStats,WarpStateStats,PmSampling_WarpStates,LaunchStats}"
+    for section in "${ncu_sections[@]}"; do
+      section="$(echo "${section}" | xargs)"
+      [[ -z "${section}" ]] && continue
+      ncu_cmd+=(--section "${section}")
+    done
+    if [[ -n "${NCU_EXTRA_ARGS:-}" ]]; then
+      local ncu_extra_args
+      read -r -a ncu_extra_args <<< "${NCU_EXTRA_ARGS}"
+      ncu_cmd+=("${ncu_extra_args[@]}")
+    fi
+
+    launch_cmd=("${ncu_cmd[@]}" -- "${launch_cmd[@]}")
+  fi
 
   if command -v setsid >/dev/null 2>&1; then
     setsid "${launch_cmd[@]}" >"${VLLM_LOG_PATH}" 2>&1 &

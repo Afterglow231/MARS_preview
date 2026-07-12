@@ -35,11 +35,11 @@ Build the local MARS vLLM tree before running GPU experiments:
 
   cd ${mars_dir}/vllm-continuum
   MODE=source bash scripts/create_continuum_vllm_conda_env.sh
-  conda activate mars
+  conda activate mas
 
 If the conda environment already exists, rebuild this source tree in it:
 
-  conda activate mars
+  conda activate mas
   cd ${mars_dir}/vllm-continuum
   rm -f vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so
   mkdir -p vllm/vllm_flash_attn

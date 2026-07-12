@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import itertools
+import json
 import math
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -36,6 +38,8 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.core.estimate_with_func import (InterceptionRecorder, ToolCallEstimator)
+from vllm.forward_step_trace import enabled as forward_step_trace_enabled
+from vllm.forward_step_trace import next_step_id as next_forward_step_id
 
 logger = init_logger(__name__)
 
@@ -128,11 +132,14 @@ class Scheduler(SchedulerInterface):
             self.policy = SchedulingPolicy.AUTELLIX
         elif self.scheduler_config.policy == "infercept":
             self.policy = SchedulingPolicy.INFERCEPT
+        elif self.scheduler_config.policy == "infercept_swap":
+            self.policy = SchedulingPolicy.INFERCEPT_SWAP
         elif self.scheduler_config.policy == "mars":
             self.policy = SchedulingPolicy.MARS
         else:
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}")
+
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
@@ -236,6 +243,86 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+
+    def _make_forward_step_profile_meta(
+        self,
+        scheduled_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+        total_num_scheduled_tokens: int,
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+    ) -> Optional[dict[str, Any]]:
+        if not forward_step_trace_enabled() or total_num_scheduled_tokens <= 0:
+            return None
+
+        prefill_tokens = 0
+        decode_tokens = 0
+        prefill_reqs = 0
+        decode_reqs = 0
+        seq_lens_after: list[int] = []
+        request_ids_sample: list[str] = []
+
+        for request in scheduled_reqs:
+            req_id = request.request_id
+            scheduled = int(num_scheduled_tokens.get(req_id, 0) or 0)
+            if scheduled <= 0:
+                continue
+
+            computed = int(getattr(request, "num_computed_tokens", 0) or 0)
+            prompt_tokens = int(getattr(request, "num_prompt_tokens", 0) or 0)
+            if prompt_tokens <= 0:
+                prompt_tokens = len(getattr(request, "prompt_token_ids", []) or [])
+
+            prefill_part = max(0, min(scheduled, prompt_tokens - computed))
+            decode_part = max(0, scheduled - prefill_part)
+            if prefill_part > 0:
+                prefill_reqs += 1
+                prefill_tokens += prefill_part
+            if decode_part > 0:
+                decode_reqs += 1
+                decode_tokens += decode_part
+
+            seq_lens_after.append(computed + scheduled)
+            if len(request_ids_sample) < 16:
+                request_ids_sample.append(str(req_id))
+
+        if prefill_tokens > 0 and decode_tokens > 0:
+            batch_mode = "pd_mixed"
+        elif prefill_tokens > 0:
+            batch_mode = "prefill_only"
+        elif decode_tokens > 0:
+            batch_mode = "decode_only"
+        else:
+            batch_mode = "other"
+
+        spec_decode_tokens = sum(
+            len(tokens) for tokens in scheduled_spec_decode_tokens.values())
+        policy = getattr(self.policy, "value", str(self.policy))
+        meta: dict[str, Any] = {
+            "schema": "stamp_forward_step_v1",
+            "backend": "vllm",
+            "engine": "mars_vllm",
+            "step_id": next_forward_step_id(),
+            "scheduler_time_s": time.time(),
+            "policy": str(policy),
+            "batch_mode": batch_mode,
+            "scheduled_req_count": len(num_scheduled_tokens),
+            "running_queue_len": len(self.running),
+            "waiting_queue_len": len(self.waiting),
+            "total_scheduled_tokens": int(total_num_scheduled_tokens),
+            "prefill_req_count": int(prefill_reqs),
+            "prefill_token_count": int(prefill_tokens),
+            "decode_req_count": int(decode_reqs),
+            "decode_token_count": int(decode_tokens),
+            "spec_decode_token_count": int(spec_decode_tokens),
+            "request_ids_sample": request_ids_sample,
+        }
+        if seq_lens_after:
+            meta.update({
+                "seq_len_sum_after": int(sum(seq_lens_after)),
+                "seq_len_min_after": int(min(seq_lens_after)),
+                "seq_len_max_after": int(max(seq_lens_after)),
+            })
+        return meta
 
     def pop_running_request_based_on_last_step(self, request: Request) -> tuple[Request, bool]:
         """Pop a request from running queue based on job_id level FCFS and last step."""
@@ -358,9 +445,59 @@ class Scheduler(SchedulerInterface):
             0, int(other_running_tokens))
         return max(0.0, float(prefill_reload_s)) * total_tokens / 2.0
 
+    @staticmethod
+    def _infercept_swap_cost_s_tokens(*, transfer_s: float,
+                                      context_tokens: int) -> float:
+        """LMCache swap overhead, represented in token-seconds."""
+        return max(0.0, float(transfer_s)) * max(0, int(context_tokens))
+
+    @staticmethod
+    def _truthy_env(name: str) -> bool:
+        return str(os.environ.get(name, "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _infercept_write_decision_log(self, request: Request,
+                                      decision: dict[str, Any]) -> None:
+        path = str(os.environ.get("INFERCEPT_KV_DECISION_LOG_FILE",
+                                  "")).strip()
+        if not path:
+            return
+        try:
+            record = {
+                "ts": time.time(),
+                "pid": os.getpid(),
+                "request_id": request.request_id,
+                "job_id": request.job_id,
+                **decision,
+            }
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.exception("Failed to write InferCept KV decision log")
+
+    def _infercept_policy_enabled(self) -> bool:
+        return self.policy in (SchedulingPolicy.INFERCEPT,
+                               SchedulingPolicy.INFERCEPT_SWAP)
+
+    def _infercept_swap_available(self) -> bool:
+        if self.connector is None:
+            return False
+        if self.policy == SchedulingPolicy.INFERCEPT_SWAP:
+            return self.connector.__class__.__name__ == (
+                "SelectiveLMCacheConnectorV1")
+        if not self._truthy_env("INFERCEPT_ENABLE_LMCACHE_SWAP"):
+            return False
+        return self.connector.__class__.__name__ == (
+            "SelectiveLMCacheConnectorV1")
+
     def _infercept_should_pin(self, request: Request) -> bool:
         """Tool-call detection."""
-        if self.policy != SchedulingPolicy.INFERCEPT:
+        if not self._infercept_policy_enabled():
             return False
         if request.job_id is None:
             return False
@@ -413,6 +550,95 @@ class Scheduler(SchedulerInterface):
             ttl_s,
         )
         return max(0.0, ttl_s)
+
+    def _infercept_choose_kv_action(
+            self, request: Request) -> Optional[dict[str, Any]]:
+        """Choose evict, preserve, or swap for a finished tool-call request."""
+        if not self._infercept_should_pin(request):
+            return None
+
+        c_i = self._infercept_context_tokens(request)
+        if c_i <= 0:
+            return {
+                "action": "evict",
+                "reason": "empty_context",
+                "context_tokens": c_i,
+            }
+
+        c_other = self._infercept_other_running_tokens(request)
+        tool = request.this_func_call
+        hold_s = self.tool_call_estimator.estimate_tool_hold_s(
+            tool, env_prefix="INFERCEPT")
+        prefill_reload_s = self.tool_call_estimator.estimate_prefill_reload_s(
+            c_i, env_prefix="INFERCEPT")
+        evict_cost = self._infercept_chunked_discard_cost_s_tokens(
+            prefill_reload_s=prefill_reload_s,
+            context_tokens=c_i,
+            other_running_tokens=c_other,
+        )
+        preserve_cost = self._infercept_preserve_cost_s_tokens(
+            hold_s=hold_s,
+            context_tokens=c_i,
+        )
+
+        costs: dict[str, float] = {
+            "evict": evict_cost,
+            "preserve": preserve_cost,
+        }
+        transfer_s: Optional[float] = None
+        if self._infercept_swap_available():
+            transfer_s = self.tool_call_estimator.estimate_swap_transfer_s(
+                c_i, env_prefix="INFERCEPT")
+            costs["swap"] = self._infercept_swap_cost_s_tokens(
+                transfer_s=transfer_s,
+                context_tokens=c_i,
+            )
+
+        # Prefer lower GPU residency when costs tie.
+        tie_order = {"evict": 0, "swap": 1, "preserve": 2}
+        action = min(costs, key=lambda k: (costs[k], tie_order[k]))
+        decision: dict[str, Any] = {
+            "action": action,
+            "tool": tool,
+            "context_tokens": int(c_i),
+            "other_running_tokens": int(c_other),
+            "hold_s": float(hold_s),
+            "prefill_reload_s": float(prefill_reload_s),
+            "swap_transfer_s": float(transfer_s)
+            if transfer_s is not None else None,
+            "costs_s_tokens": {
+                k: float(v)
+                for k, v in costs.items()
+            },
+            "swap_available": bool(self._infercept_swap_available()),
+        }
+        logger.info(
+            "InferCept KV decision request=%s job=%s action=%s tool=%s "
+            "context_tokens=%d other_tokens=%d hold_s=%.6f "
+            "prefill_reload_s=%.6f swap_transfer_s=%s costs=%s",
+            request.request_id,
+            request.job_id,
+            action,
+            tool,
+            c_i,
+            c_other,
+            hold_s,
+            prefill_reload_s,
+            (f"{transfer_s:.6f}" if transfer_s is not None else "n/a"),
+            decision["costs_s_tokens"],
+        )
+        self._infercept_write_decision_log(request, decision)
+        return decision
+
+    def _infercept_prepare_finished_request(self, request: Request) -> None:
+        decision = self._infercept_choose_kv_action(request)
+        if decision is None:
+            for attr in ("_infercept_kv_action", "_infercept_kv_decision"):
+                if hasattr(request, attr):
+                    delattr(request, attr)
+            return
+        request._infercept_kv_action = str(decision["action"])
+        request._infercept_kv_decision = decision
 
     def _mars_remaining_level(self, request: Request, *,
                               num_computed_tokens: Optional[int] = None) -> int:
@@ -959,7 +1185,8 @@ class Scheduler(SchedulerInterface):
                     #The current implementation is basically giving priority to jobs with less prefill tokens.
                     request = self.waiting.peek_request(self.pinned_requests, self.kv_cache_manager, self.connector)
                 elif self.policy in (SchedulingPolicy.AUTELLIX,
-                                     SchedulingPolicy.INFERCEPT):
+                                     SchedulingPolicy.INFERCEPT,
+                                     SchedulingPolicy.INFERCEPT_SWAP):
                     request = self.waiting.peek_request()
                 else:
                     raise ValueError(f"Invalid policy: {self.policy}")
@@ -1172,7 +1399,8 @@ class Scheduler(SchedulerInterface):
                     if len(self.running) == 0 and self.pinned_requests:
                         if self.policy in (SchedulingPolicy.CONTINUUM,
                                            SchedulingPolicy.CONTINUUM_DY,
-                                           SchedulingPolicy.INFERCEPT):
+                                           SchedulingPolicy.INFERCEPT,
+                                           SchedulingPolicy.INFERCEPT_SWAP):
                             preempted_req, _ = self.pop_running_request_based_on_last_step(request)
                             if preempted_req in scheduled_running_reqs:
                                 scheduled_running_reqs.remove(preempted_req)
@@ -1344,6 +1572,16 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
         )
+        profile_meta = self._make_forward_step_profile_meta(
+            scheduled_new_reqs + scheduled_resumed_reqs +
+            scheduled_running_reqs,
+            num_scheduled_tokens,
+            total_num_scheduled_tokens,
+            scheduled_spec_decode_tokens,
+        )
+        if profile_meta is not None:
+            scheduler_output.profile_step_id = int(profile_meta["step_id"])
+            scheduler_output.profile_batch_meta = profile_meta
         #print(f"scheduler_output: {scheduler_output}")
     
         # NOTE (Hanchen) this will handle the KVConnector
@@ -1978,6 +2216,7 @@ class Scheduler(SchedulerInterface):
                     is_done = True
                 if is_done:
                     self._autellix_finished_job_ids.add(job_id)
+        self._infercept_prepare_finished_request(request)
         # NOTE (Hanchen) in unpin, we need to make sure it is not delay free blocks because it could be still waiting for transfer, 
         # need to copy something similar to the kv_xfer_params
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
@@ -2002,6 +2241,29 @@ class Scheduler(SchedulerInterface):
 
         self._mars_level_by_req_id.pop(request.request_id, None)
         self._mars_last_scheduled_by_req_id.pop(request.request_id, None)
+
+        infercept_action = getattr(request, "_infercept_kv_action", None)
+        infercept_decision = getattr(request, "_infercept_kv_decision", None)
+        if infercept_action == "preserve":
+            length_of_pin = 0.0
+            if isinstance(infercept_decision, dict):
+                length_of_pin = float(infercept_decision.get("hold_s") or 0.0)
+            if length_of_pin > 0.01:
+                self.pin_request(request, length_of_pin)
+                del self.requests[request.request_id]
+                return
+            infercept_action = "evict"
+
+        if infercept_action in ("evict", "swap"):
+            logger.debug(
+                "InferCept KV action %s frees request=%s job=%s",
+                infercept_action,
+                request.request_id,
+                request.job_id,
+            )
+            self.kv_cache_manager.free(request)
+            del self.requests[request.request_id]
+            return
         
         # TODO (Hanchen) check if we want to pin this memory here for how long, pin them on scheduler level.
         if (self.policy in (SchedulingPolicy.CONTINUUM,

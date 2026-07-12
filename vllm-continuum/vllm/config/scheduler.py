@@ -30,6 +30,7 @@ SchedulerPolicy = Literal[
     "continuum_dy",
     "autellix",
     "infercept",
+    "infercept_swap",
     "mars",
 ]
 
@@ -143,6 +144,9 @@ class SchedulerConfig:
     attained service with discretized priority queues and anti-starvation.\n
     - "infercept" means an intercept-aware scheduler that makes KV retainment
     decisions around tool-call interceptions.\n
+    - "infercept_swap" means InferCept with an LMCache-backed swap option:
+    tool-call KV can be evicted, preserved on GPU, or saved to LMCache and
+    later restored, depending on the cost model.\n
     - "mars" means MARS scheduling: an adaptive co-scheduling policy for
     heterogeneous agentic workloads. It coordinates GPU inference and CPU
     tool execution under coupled resource pressure, decouples admission from

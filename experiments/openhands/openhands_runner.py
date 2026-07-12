@@ -28,6 +28,10 @@ SANDBOX_SHELL_PATH = Path(__file__).with_name("sandbox_shell.sh")
 HOST_HOME = Path(os.environ.get("MARS_HOST_HOME") or Path.home()).expanduser().resolve()
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
 def _load_openhands_sdk() -> dict[str, Any]:
     try:
         from pydantic import SecretStr
@@ -89,10 +93,13 @@ def _build_tools(config: OpenHandsConfig, sdk: dict[str, Any]) -> list[Any]:
     terminal_params: dict[str, Any] = {}
     if config.terminal_no_change_timeout_s is not None:
         terminal_params["no_change_timeout_seconds"] = int(config.terminal_no_change_timeout_s)
-    # Force subprocess mode so we can route all terminal commands through the
-    # workspace-scoped sandbox shell instead of a host-level tmux session.
-    terminal_params["terminal_type"] = "subprocess"
-    terminal_params["shell_path"] = str(SANDBOX_SHELL_PATH)
+    if not _env_flag("MARS_OPENHANDS_DEFAULT_TERMINAL"):
+        # Force subprocess mode so we can route all terminal commands through the
+        # workspace-scoped sandbox shell instead of a host-level tmux session.
+        terminal_type = config.terminal_type or "subprocess"
+        terminal_params["terminal_type"] = terminal_type
+        if terminal_type == "subprocess":
+            terminal_params["shell_path"] = str(SANDBOX_SHELL_PATH)
 
     return [
         Tool(name=TerminalTool.name, params=terminal_params),
@@ -275,6 +282,8 @@ def run_task_request(
             "workspace_dir": str(workspace_dir),
             "runtime_dir": runtime_env.get("MARS_RUNTIME_DIR"),
             "artifact_dir": runtime_env.get("MARS_ARTIFACT_DIR"),
+            "openhands_default_terminal": _env_flag("MARS_OPENHANDS_DEFAULT_TERMINAL"),
+            "terminal_type": config.terminal_type,
         }
     )
 

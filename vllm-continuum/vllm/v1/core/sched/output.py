@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from vllm import bc_linter_include
 
@@ -160,3 +160,7 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
+    # Optional MARS per-forward-step profiling metadata. 
+    profile_step_id: Optional[int] = None
+    profile_batch_meta: Optional[dict[str, Any]] = None

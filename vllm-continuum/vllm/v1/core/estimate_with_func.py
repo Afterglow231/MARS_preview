@@ -306,6 +306,98 @@ class ToolCallEstimator:
 
         return max(0.0, 0.0002 * x)
 
+    def estimate_swap_transfer_s(
+        self,
+        context_tokens: int,
+        *,
+        env_prefix: str = "INFERCEPT",
+        fallback_env_prefixes: tuple[str, ...] = ("LMCACHE",),
+    ) -> float:
+        """Estimate total LMCache swap-out + swap-in transfer time."""
+        x = float(max(0, context_tokens))
+
+        prefixes: list[str] = []
+        for prefix in (env_prefix, *fallback_env_prefixes):
+            if prefix and prefix not in prefixes:
+                prefixes.append(prefix)
+
+        for prefix in prefixes:
+            quad = os.environ.get(f"{prefix}_SWAP_TRANSFER_QUAD")
+            if not quad:
+                continue
+            try:
+                a_str, b_str, c_str = quad.split(",")
+                a = float(a_str.strip())
+                b = float(b_str.strip())
+                c = float(c_str.strip())
+                return max(0.0, a * x * x + b * x + c)
+            except Exception:
+                logger.warning(
+                    "Ignoring invalid %s_SWAP_TRANSFER_QUAD=%r", prefix, quad)
+
+        total = 0.0
+        saw_component = False
+        for suffix in ("SWAP_OUT_S_PER_TOKEN", "SWAP_IN_S_PER_TOKEN"):
+            for prefix in prefixes:
+                raw = os.environ.get(f"{prefix}_{suffix}")
+                if raw is None:
+                    continue
+                try:
+                    total += max(0.0, float(raw) * x)
+                    saw_component = True
+                    break
+                except ValueError:
+                    logger.warning("Ignoring invalid %s_%s=%r", prefix,
+                                   suffix, raw)
+        if saw_component:
+            return total
+
+        for prefix in prefixes:
+            raw = os.environ.get(f"{prefix}_SWAP_S_PER_TOKEN")
+            if raw is None:
+                continue
+            try:
+                return max(0.0, float(raw) * x)
+            except ValueError:
+                logger.warning("Ignoring invalid %s_SWAP_S_PER_TOKEN=%r",
+                               prefix, raw)
+
+        for prefix in prefixes:
+            raw = os.environ.get(f"{prefix}_SWAP_FIXED_S")
+            if raw is None:
+                continue
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                logger.warning("Ignoring invalid %s_SWAP_FIXED_S=%r", prefix,
+                               raw)
+
+        # Conservative default: both directions over a local CPU backend are
+        # usually cheaper than full recompute but not free.
+        return max(0.0, 0.00004 * x)
+
+    def estimate_tool_hold_s(
+        self,
+        tool: Optional[str],
+        *,
+        env_prefix: str = "INFERCEPT",
+        default_s: float = FIXED_THRESHOLD_CONTINUUM,
+    ) -> float:
+        """Estimate how long GPU KV would need to be preserved."""
+        if tool:
+            known = self.get_func_call_exec_time(tool)
+            if known is not None:
+                return max(0.0, float(known))
+
+        raw = os.environ.get(f"{env_prefix}_DEFAULT_TOOL_TIME_S")
+        if raw is not None:
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                logger.warning("Ignoring invalid %s_DEFAULT_TOOL_TIME_S=%r",
+                               env_prefix, raw)
+        return max(0.0, float(default_s))
+
     def calc_ttl_continuum_dynamic(
         self,
         *,
