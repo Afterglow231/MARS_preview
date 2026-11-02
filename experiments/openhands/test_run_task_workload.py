@@ -11,6 +11,7 @@ REPO_ROOT = THIS_DIR.parents[1]
 sys.path.insert(0, str(THIS_DIR))
 
 import run_task_workload as workload
+import common
 
 
 def test_safe_print_tolerates_broken_pipe() -> None:
@@ -92,6 +93,33 @@ def test_localize_task_inputs_rewrites_payload_and_workspace_meta(tmp_path: Path
     assert (payload_path / "README.md").read_text(encoding="utf-8") == "cached repo\n"
     assert stats["unique_copied_paths"] == 1
     assert stats["rewritten_paths"] >= 2
+
+
+def test_task_loader_relocates_foreign_swebench_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cache_root = tmp_path / "models" / "swebench_repo_cache"
+    monkeypatch.setattr(common, "SWEBENCH_CACHE_ROOT", cache_root)
+    tasks_path = tmp_path / "tasks.jsonl"
+    task = {
+        "schema": "mas_task_v1",
+        "benchmark": "swebench",
+        "task_id": "demo",
+        "request_id": "demo",
+        "workspace_init": [],
+        "payload": {
+            "repo_cache_path": (
+                "/home/old-user/models/swebench_repo_cache/django__django"
+            )
+        },
+    }
+    tasks_path.write_text(json.dumps(task) + "\n", encoding="utf-8")
+
+    loaded = common.load_tasks_jsonl(tasks_path)
+
+    assert loaded[0]["payload"]["repo_cache_path"] == str(
+        cache_root / "django__django"
+    )
 
 
 def test_require_path_under_rejects_workspace_outside_out_dir(tmp_path: Path) -> None:

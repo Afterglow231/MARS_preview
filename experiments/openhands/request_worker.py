@@ -42,7 +42,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--max-output-tokens", type=int, default=2048)
     ap.add_argument("--llm-timeout-s", type=int, default=3000)
     ap.add_argument("--llm-num-retries", type=int, default=3)
-    ap.add_argument("--max-iterations", type=int, default=40)
+    ap.add_argument("--max-iterations", type=int, default=100)
     ap.add_argument("--terminal-no-change-timeout-s", type=int, default=30)
     ap.add_argument(
         "--terminal-type",

@@ -10,7 +10,7 @@ from typing import Any
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 
-from common import OPENHANDS_FORCE_STRING_SERIALIZER, now_s
+from common import BENCHMARK_ROOT, OPENHANDS_FORCE_STRING_SERIALIZER, now_s
 from llm_trace_bridge import install_llm_trace_patch, register_llm_collector, unregister_llm_collector
 from request_bootstrap import (
     build_user_request,
@@ -18,6 +18,7 @@ from request_bootstrap import (
     materialize_workspace_init,
     requires_tool_verification,
 )
+from sandbox_paths import task_readonly_paths
 from tool_trace_bridge import wrap_agent_tools
 from trace_writer import RequestTraceCollector
 
@@ -251,6 +252,19 @@ def run_task_request(
     workspace_dir = (workspace_root / request_id).resolve()
     workspace_dir.mkdir(parents=True, exist_ok=True)
     runtime_env = _apply_workspace_runtime_env(workspace_dir)
+    local_inputs_root = Path(
+        os.environ.get("MARS_LOCAL_INPUTS_DIR", str(workspace_dir))
+    ).expanduser().resolve(strict=False)
+    request_readonly_paths = task_readonly_paths(
+        task,
+        allowed_roots=(local_inputs_root, BENCHMARK_ROOT),
+    )
+    runtime_env["MARS_REQUEST_READONLY_PATHS"] = "\n".join(
+        str(path) for path in request_readonly_paths
+    )
+    os.environ["MARS_REQUEST_READONLY_PATHS"] = runtime_env[
+        "MARS_REQUEST_READONLY_PATHS"
+    ]
     sdk = _load_openhands_sdk()
     Agent = sdk["Agent"]
     Conversation = sdk["Conversation"]
@@ -364,6 +378,10 @@ def run_task_request(
             else None
         )
     finally:
+        # The agent's native state is terminal now. Freeze the comparable
+        # request boundary before Conversation.close() tears down sandboxes and
+        # other runtime resources.
+        collector.mark_frontend_terminal()
         unregister_llm_collector(llm)
         if conversation is not None:
             try:
