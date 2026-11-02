@@ -26,6 +26,20 @@ mars_default_python() {
   printf '%s\n' "${candidate}"
 }
 
+mars_default_openhands_python() {
+  local host_home="$1"
+  local candidate
+  for candidate in \
+    "${host_home}/.venvs/openhands312/bin/python" \
+    "${host_home}/.venvs/openhands313/bin/python"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  printf '%s\n' "${host_home}/.venvs/openhands312/bin/python"
+}
+
 mars_print_vllm_build_help() {
   local mars_dir="$1"
   local python_bin="${2:-python}"
@@ -35,11 +49,11 @@ Build the local MARS vLLM tree before running GPU experiments:
 
   cd ${mars_dir}/vllm-continuum
   MODE=source bash scripts/create_continuum_vllm_conda_env.sh
-  conda activate mas
+  conda activate mars
 
 If the conda environment already exists, rebuild this source tree in it:
 
-  conda activate mas
+  conda activate mars
   cd ${mars_dir}/vllm-continuum
   rm -f vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so
   mkdir -p vllm/vllm_flash_attn
@@ -123,6 +137,38 @@ mars_infer_tp_from_devices() {
   else
     echo "${#_mars_gpus[@]}"
   fi
+}
+
+# Print all compute-process PIDs on the selected physical GPUs.  Experiment
+# launchers use this shared, deliberately command-agnostic guard so an
+# unrelated CUDA workload cannot silently degrade only one backend.
+mars_gpu_compute_pids() {
+  local gpu_spec="${1// /}"
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+
+  local raw_pids=""
+  if [[ -n "${gpu_spec}" && "${gpu_spec,,}" != "all" ]]; then
+    local gpu_id
+    IFS=',' read -r -a _mars_gpu_guard_list <<< "${gpu_spec}"
+    for gpu_id in "${_mars_gpu_guard_list[@]}"; do
+      [[ -z "${gpu_id}" ]] && continue
+      raw_pids+="$(
+        nvidia-smi -i "${gpu_id}" \
+          --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null || true
+      )"$'\n'
+    done
+  else
+    raw_pids="$(
+      nvidia-smi --query-compute-apps=pid \
+        --format=csv,noheader,nounits 2>/dev/null || true
+    )"
+  fi
+
+  printf '%s\n' "${raw_pids}" \
+    | awk '{print $1}' \
+    | sed '/^[0-9][0-9]*$/!d' \
+    | sort -nu \
+    | paste -sd, -
 }
 
 mars_merge_additional_config() {

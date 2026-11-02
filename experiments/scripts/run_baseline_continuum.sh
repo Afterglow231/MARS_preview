@@ -73,7 +73,8 @@ THREAD_POOL="${THREAD_POOL:-on}"
 CPU_TOOL="${CPU_TOOL:-16-23}"
 CPU_GPU="${CPU_GPU:-0-1}"
 
-# Available scheduling policies: fcfs/autellix/infercept/continuum/continuum_dy/mars
+# Available scheduling policies:
+# fcfs/autellix/infercept/infercept_swap/continuum/continuum_dy/lightllm/mars
 SCHEDULING_POLICY="${SCHEDULING_POLICY:-mars}"
 
 # Optional Autellix tail fallback: after N finished jobs, switch to FCFS.
@@ -127,37 +128,10 @@ fi
 if [[ "${ALLOW_CONCURRENT_RUNS}" != "1" && "${ALLOW_CONCURRENT_RUNS}" != "on" && "${ALLOW_CONCURRENT_RUNS}" != "true" ]]; then
   GPU_GUARD_DEVICES="${GPU_GUARD_DEVICES:-${CUDA_VISIBLE_DEVICES}}"
   GPU_GUARD_DEVICES="${GPU_GUARD_DEVICES// /}"
-  GPU_PIDS_RAW=""
-  if [[ -n "${GPU_GUARD_DEVICES}" && "${GPU_GUARD_DEVICES}" != "all" ]]; then
-    IFS=',' read -r -a _gpu_guard_list <<< "${GPU_GUARD_DEVICES}"
-    GPU_PIDS_RAW="$(
-      for gpu_id in "${_gpu_guard_list[@]}"; do
-        [[ -z "${gpu_id}" ]] && continue
-        nvidia-smi -i "${gpu_id}" --query-compute-apps=pid --format=csv,noheader 2>/dev/null || true
-      done
-    )"
-  else
-    GPU_PIDS_RAW="$(
-      nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null || true
-    )"
-  fi
-  EXISTING_RUN_PIDS="$(
-    printf "%s\n" "${GPU_PIDS_RAW}" \
-      | awk '{print $1}' \
-      | sed '/^[0-9][0-9]*$/!d' \
-      | sort -u \
-      | while read -r pid; do
-          cmd="$(ps -o cmd= -p "${pid}" 2>/dev/null || true)"
-          [[ -z "${cmd}" ]] && continue
-          if [[ "${cmd}" == *"run_experiment.py"* || "${cmd}" == *"VLLM::EngineCore"* || "${cmd}" == *"vllm"* ]]; then
-            printf "%s " "${pid}"
-          fi
-        done
-  )"
-  EXISTING_RUN_PIDS="$(echo "${EXISTING_RUN_PIDS}" | sed 's/[[:space:]]*$//')"
+  EXISTING_RUN_PIDS="$(mars_gpu_compute_pids "${GPU_GUARD_DEVICES}")"
   if [[ -n "${EXISTING_RUN_PIDS}" ]]; then
-    echo "Another GPU baseline run is already active on guarded GPU(s) [${GPU_GUARD_DEVICES}] (PID(s): ${EXISTING_RUN_PIDS})." >&2
-    echo "Stop old runs first, or set ALLOW_CONCURRENT_RUNS=1 to bypass this guard." >&2
+    echo "Selected GPU(s) [${GPU_GUARD_DEVICES}] are not idle (compute PID(s): ${EXISTING_RUN_PIDS})." >&2
+    echo "Use free GPUs or set ALLOW_CONCURRENT_RUNS=1 explicitly." >&2
     exit 1
   fi
 fi

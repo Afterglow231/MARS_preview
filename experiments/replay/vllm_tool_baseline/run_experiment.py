@@ -43,6 +43,8 @@ from vllm import AsyncEngineArgs, SamplingParams
 from vllm.config.kv_events import KVEventsConfig
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.sampling_params import GuidedDecodingParams
+from vllm.v1.core.sched.lightllm_policy import (
+    ADDED_OUTPUT_LEN, INITIAL_EMA_OUTPUT_LEN, LIGHTLLM_UPSTREAM_COMMIT)
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from lib import (
@@ -1668,6 +1670,47 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     engine = AsyncLLM.from_engine_args(engine_args)
 
+    lightllm_policy_manifest: Optional[dict[str, Any]] = None
+    if str(args.scheduling_policy) == "lightllm":
+        scheduler_config = engine.vllm_config.scheduler_config
+        configured_chunk = scheduler_config.lightllm_chunked_prefill_size
+        effective_chunk = (
+            int(configured_chunk)
+            if configured_chunk is not None
+            else max(1, int(scheduler_config.max_num_batched_tokens) // 2)
+        )
+        cache_config = engine.vllm_config.cache_config
+        block_size = int(cache_config.block_size)
+        num_gpu_blocks = int(cache_config.num_gpu_blocks)
+        lightllm_policy_manifest = {
+            "schema": "mars_lightllm_scheduler_port_v1",
+            "upstream_repo": "https://github.com/ModelTC/LightLLM",
+            "upstream_commit": LIGHTLLM_UPSTREAM_COMMIT,
+            "scope": "scheduler_policy_only",
+            "execution_engine": "mars-vllm",
+            "router_token_ratio": float(
+                scheduler_config.lightllm_router_token_ratio),
+            "router_max_wait_tokens": int(
+                scheduler_config.lightllm_router_max_wait_tokens),
+            "chunked_prefill_size": effective_chunk,
+            "batch_max_tokens": int(
+                scheduler_config.max_num_batched_tokens),
+            "running_max_req_size": int(scheduler_config.max_num_seqs),
+            "usable_kv_capacity_tokens": (
+                max(0, num_gpu_blocks - 1) * block_size),
+            "kv_block_size": block_size,
+            "chunked_prefill_enabled": bool(
+                scheduler_config.chunked_prefill_enabled),
+            "prefix_caching_enabled": bool(
+                cache_config.enable_prefix_caching),
+            "added_output_len": ADDED_OUTPUT_LEN,
+            "initial_ema_output_len": INITIAL_EMA_OUTPUT_LEN,
+        }
+        atomic_write_json(
+            out_dir / "lightllm_policy_provenance.json",
+            lightllm_policy_manifest,
+        )
+
     prefill_tokens_csv: Optional[Path] = None
     prefill_tokens_by_request_id: dict[str, int] = {}
     if args.prefill_tokens_csv:
@@ -1715,6 +1758,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "parse_feedback_enabled": bool(enable_parse_feedback),
         "parse_feedback_max_retry": int(request_retry_max),
         "scheduling_policy": str(args.scheduling_policy),
+        "lightllm_policy": lightllm_policy_manifest,
         "infercept_kv_decision_log_file": (
             str(infercept_decision_log_path)
             if infercept_decision_log_path is not None else None),
@@ -2825,6 +2869,7 @@ def main() -> None:
             "autellix",
             "infercept",
             "infercept_swap",
+            "lightllm",
             "mars",
         ],
         default="fcfs",

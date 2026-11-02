@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 from common import (
     JSONLWriter,
     KVEventsCollector,
+    OPENHANDS_FORCE_STRING_SERIALIZER,
     atomic_write_json,
     load_tasks_jsonl,
     mean,
@@ -53,6 +54,11 @@ LOCAL_INPUT_PATH_KEYS = {
     "repo_cache_path",
     "src_path",
 }
+# TerminalBench task trees can contain large Docker build contexts.  Resolve
+# their portable placeholder but keep the source tree in place; the agent CLI
+# binds only the exact per-request task directory read-only and reaches Docker
+# through its scoped proxy.
+READ_ONLY_INPUT_PATH_KEYS = {"task_dir"}
 
 
 def _safe_print(*args: Any, **kwargs: Any) -> None:
@@ -243,7 +249,7 @@ def _looks_like_url(text: str) -> bool:
     )
 
 
-def _expand_existing_local_path(value: str) -> Path | None:
+def _expand_local_path(value: str) -> Path | None:
     text = str(value).strip()
     if not text or _looks_like_url(text):
         return None
@@ -255,7 +261,12 @@ def _expand_existing_local_path(value: str) -> Path | None:
         resolved = path.resolve(strict=False)
     except Exception:
         resolved = path
-    if not resolved.exists():
+    return resolved
+
+
+def _expand_existing_local_path(value: str) -> Path | None:
+    resolved = _expand_local_path(value)
+    if resolved is None or not resolved.exists():
         return None
     return resolved
 
@@ -352,6 +363,16 @@ def _rewrite_local_input_paths(
 
     rewritten: dict[str, Any] = {}
     for key, value in obj.items():
+        if key in READ_ONLY_INPUT_PATH_KEYS and isinstance(value, str):
+            src = _expand_local_path(value)
+            if src is not None:
+                rewritten_value = str(src)
+                if rewritten_value != value:
+                    stats["rewritten_readonly_paths"] = int(
+                        stats.get("rewritten_readonly_paths", 0)
+                    ) + 1
+                rewritten[key] = rewritten_value
+                continue
         if key in LOCAL_INPUT_PATH_KEYS and isinstance(value, str):
             src = _expand_existing_local_path(value)
             if src is not None:
@@ -359,6 +380,15 @@ def _rewrite_local_input_paths(
                 if localized != value:
                     stats["rewritten_paths"] = int(stats.get("rewritten_paths", 0)) + 1
                 rewritten[key] = localized
+                continue
+            missing_src = _expand_local_path(value)
+            if missing_src is not None:
+                rewritten_value = str(missing_src)
+                if rewritten_value != value:
+                    stats["rewritten_missing_paths"] = int(
+                        stats.get("rewritten_missing_paths", 0)
+                    ) + 1
+                rewritten[key] = rewritten_value
                 continue
         rewritten[key] = _rewrite_local_input_paths(
             value,
@@ -1178,6 +1208,7 @@ def main() -> None:
                 "mars_no_kv_active_limit": args.mars_no_kv_active_limit,
                 "prefill_tokenizer": args.prefill_tokenizer,
                 "openhands_python": str(Path(args.openhands_python).expanduser()),
+                "force_string_serializer": OPENHANDS_FORCE_STRING_SERIALIZER,
                 "allow_workspace_outside_out_dir": bool(args.allow_workspace_outside_out_dir),
                 "localize_task_inputs": not bool(args.no_localize_task_inputs),
                 "browser_enabled": False,
@@ -1221,6 +1252,7 @@ def main() -> None:
         },
         "scheduling_policy": args.scheduling_policy,
         "runtime_bundle_dir": str(runtime_bundle_dir),
+        "force_string_serializer": OPENHANDS_FORCE_STRING_SERIALIZER,
         "kv_events": bool(args.kv_events),
         "kv_events_endpoint": args.kv_events_endpoint,
     }

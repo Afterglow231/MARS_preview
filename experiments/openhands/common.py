@@ -12,8 +12,16 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+OPENHANDS_FORCE_STRING_SERIALIZER = True
+
 MARS_REPO_ROOT = Path(__file__).resolve().parents[2]
-BENCHMARK_ROOT = MARS_REPO_ROOT / "benchmark"
+# A workload can be launched from one MARS checkout while its immutable
+# benchmark assets live in another (the agent-baseline launchers do exactly
+# this).  Keep the historical checkout-local default, but honor the explicit
+# benchmark root used by the launcher before relocating embedded task paths.
+BENCHMARK_ROOT = Path(
+    os.environ.get("MARS_BENCHMARK_ROOT", str(MARS_REPO_ROOT / "benchmark"))
+).expanduser().resolve(strict=False)
 _MARS_BENCHMARK_PREFIX_RE = re.compile(r"/[^\"'\s]*/MARS/benchmark/")
 _GIT_TASK_BENCH_ALIAS_RE = re.compile(r"(?<!benchmark)/GitTaskBench(?=/|$)")
 _BENCHMARK_ROOT_PLACEHOLDERS = (

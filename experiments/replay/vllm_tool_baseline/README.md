@@ -12,7 +12,7 @@ export MODEL_PATH=${MODEL_PATH:-$HOME/models/Qwen3-Coder-30B-A3B-Instruct}
 ## Quick Run
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 \
+CUDA_VISIBLE_DEVICES=0 \
 python3 experiments/replay/vllm_tool_baseline/run_experiment.py \
   --tasks benchmark/hybrid_workloads/test_workload.jsonl \
   --model-path "$MODEL_PATH" \
@@ -24,12 +24,42 @@ python3 experiments/replay/vllm_tool_baseline/run_experiment.py \
 The wrapper script provides the same path-relative defaults:
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 \
+CUDA_VISIBLE_DEVICES=0 \
 MODEL_PATH="$MODEL_PATH" \
 TASKS_PATH=$PWD/benchmark/hybrid_workloads/test_workload.jsonl \
 NUM_REQUESTS=10 RPS=0.2 SCHEDULING_POLICY=mars \
 bash experiments/scripts/run_baseline_continuum.sh
 ```
+
+Supported in-process policies include `fcfs`, `priority`, `continuum`,
+`continuum_dy`, `autellix`, `infercept`, `infercept_swap`, `lightllm`, and
+`mars`.
+
+## LightLLM Policy
+
+Use `lightllm` to compare the ported LightLLM scheduling policy with MARS and
+the other policies while retaining the same vLLM execution engine and tool
+simulator:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+MODEL_PATH="$MODEL_PATH" \
+TASKS_PATH=$PWD/benchmark/hybrid_workloads/test_workload.jsonl \
+NUM_REQUESTS=400 RPS=0.2 SCHEDULING_POLICY=lightllm \
+  bash experiments/scripts/run_baseline_continuum.sh
+```
+
+The port follows upstream LightLLM commit
+[`5d59e4907dc9b5338426b56723bdee42d8af9309`](https://github.com/ModelTC/LightLLM/commit/5d59e4907dc9b5338426b56723bdee42d8af9309)
+(Apache-2.0) for strict FCFS admission, peak KV-token estimation,
+output-length EMA, prefix-aware last-token classification, and aggressive
+prefill/decode packing. Unsupported parallel/data-plane modes fail fast rather
+than silently changing the policy. It is not the native
+LightLLM server: vLLM still supplies request execution, paged KV allocation,
+preemption, caching, CUDA graphs, and kernels. Use the separate
+[`lightllm_native` OpenHands path](../../baselines/lightllm/README.md) for a
+full-system LightLLM comparison, and do not attribute results across the two
+tracks as scheduler-only effects.
 
 ## InferCept + LMCache Swap
 
@@ -37,7 +67,7 @@ Use `infercept_swap` to let InferCept choose among evict, preserve-on-GPU, and
 LMCache-backed swap for tool-call KV:
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 \
+CUDA_VISIBLE_DEVICES=0 \
 python3 experiments/replay/vllm_tool_baseline/run_experiment.py \
   --tasks benchmark/hybrid_workloads/test_workload.jsonl \
   --model-path "$MODEL_PATH" \

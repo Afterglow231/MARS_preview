@@ -10,22 +10,8 @@ MARS_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 HOST_HOME="${HOME:-$(getent passwd "$(id -un)" | cut -d: -f6)}"
 source "${SCRIPT_DIR}/common_runtime.sh"
 
-default_openhands_python() {
-  local candidate
-  for candidate in \
-    "${HOST_HOME}/.venvs/openhands313/bin/python" \
-    "${HOST_HOME}/.venvs/openhands312/bin/python" \
-    "${HOST_HOME}/.archived_venvs"/openhands313*/bin/python; do
-    if [[ -x "${candidate}" ]]; then
-      printf '%s\n' "${candidate}"
-      return 0
-    fi
-  done
-  printf '%s\n' "${HOST_HOME}/.venvs/openhands313/bin/python"
-}
-
-MARS_PYTHON="${MARS_PYTHON:-$(mars_default_python "${HOST_HOME}/miniconda3/envs/mas/bin/python")}"
-OPENHANDS_PYTHON="${OPENHANDS_PYTHON:-$(default_openhands_python)}"
+MARS_PYTHON="${MARS_PYTHON:-$(mars_default_python "${HOST_HOME}/miniconda3/envs/mars/bin/python")}"
+OPENHANDS_PYTHON="${OPENHANDS_PYTHON:-$(mars_default_openhands_python "${HOST_HOME}")}"
 OPENHANDS_RUNNER="${MARS_DIR}/experiments/openhands/run_task_workload.py"
 
 # Resources.
@@ -41,7 +27,7 @@ TP="${TP:-}"
 # Model and vLLM.
 MODEL_PATH="${MODEL_PATH:-${HOST_HOME}/models/Qwen3-Coder-30B-A3B-Instruct}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-Coder-30B-A3B-Instruct}"
-DTYPE="${DTYPE:-auto}"
+DTYPE="${DTYPE:-bfloat16}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
@@ -90,7 +76,7 @@ SEED="${SEED:-0}"
 EMIT_MODE="${EMIT_MODE:-rps}"
 GPU_TIMEOUT_S="${GPU_TIMEOUT_S:-60000}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
-TOP_P="${TOP_P:-}"
+TOP_P="${TOP_P:-1.0}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-2048}"
 LLM_TIMEOUT_S="${LLM_TIMEOUT_S:-3000}"
 LLM_NUM_RETRIES="${LLM_NUM_RETRIES:-3}"
@@ -102,6 +88,14 @@ API_KEY="${API_KEY:-EMPTY}"
 MARS_REQUIRE_BWRAP="${MARS_REQUIRE_BWRAP:-1}"
 MARS_ALLOW_HOST_MODELS_READ="${MARS_ALLOW_HOST_MODELS_READ:-0}"
 
+# Optional common protocol warmup.  The LightLLM launcher runs the same probe
+# before delegating here and sets this to 0 to avoid a duplicate warmup.
+OPENAI_COMPAT_WARMUP="${OPENAI_COMPAT_WARMUP:-1}"
+WARMUP_REQUESTS="${WARMUP_REQUESTS:-1}"
+WARMUP_MAX_TOKENS="${WARMUP_MAX_TOKENS:-128}"
+OPENAI_COMPAT_PROBE_SCRIPT="${MARS_DIR}/experiments/baselines/lightllm/openai_compat_probe.py"
+PROVENANCE_SCRIPT="${MARS_DIR}/experiments/baselines/lightllm/capture_provenance.py"
+
 # Output.
 OUTPUT_ROOT="${OUTPUT_ROOT:-${MARS_DIR}/outputs/openhands}"
 RUN_LABEL="${RUN_LABEL:-${RUN_NAME:-openhands_qwen3_317}}"
@@ -111,6 +105,9 @@ WORKSPACE_ROOT="${WORKSPACE_ROOT:-${OUT_DIR}/workspaces}"
 LAUNCHER_LOG_PATH="${LAUNCHER_LOG_PATH:-${OUT_DIR}/launcher.log}"
 WORKLOAD_LOG_PATH="${WORKLOAD_LOG_PATH:-${OUT_DIR}/openhands_workload.log}"
 VLLM_LOG_PATH="${VLLM_LOG_PATH:-${OUT_DIR}/vllm_server.log}"
+WARMUP_ARTIFACT="${WARMUP_ARTIFACT:-${OUT_DIR}/warmup.jsonl}"
+PROVENANCE_PATH="${PROVENANCE_PATH:-${OUT_DIR}/provenance.json}"
+MODEL_HASH_MODE="${MODEL_HASH_MODE:-full}"
 
 # Server lifecycle.
 USE_EXISTING_VLLM="${USE_EXISTING_VLLM:-0}"
@@ -161,37 +158,7 @@ resolve_autellix_tail_threshold() {
 
 existing_guarded_run_pids() {
   local gpu_spec="${GPU_GUARD_DEVICES:-${CUDA_VISIBLE_DEVICES}}"
-  gpu_spec="${gpu_spec// /}"
-  command -v nvidia-smi >/dev/null 2>&1 || return 0
-
-  local raw_pids
-  if [[ -n "${gpu_spec}" && "${gpu_spec}" != "all" ]]; then
-    IFS=',' read -r -a _gpu_guard_list <<< "${gpu_spec}"
-    raw_pids="$(
-      for gpu_id in "${_gpu_guard_list[@]}"; do
-        [[ -z "${gpu_id}" ]] && continue
-        nvidia-smi -i "${gpu_id}" --query-compute-apps=pid --format=csv,noheader 2>/dev/null || true
-      done
-    )"
-  else
-    raw_pids="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null || true)"
-  fi
-
-  printf '%s\n' "${raw_pids}" \
-    | awk '{print $1}' \
-    | sed '/^[0-9][0-9]*$/!d' \
-    | sort -u \
-    | while read -r pid; do
-        cmd="$(ps -o cmd= -p "${pid}" 2>/dev/null || true)"
-        [[ -z "${cmd}" ]] && continue
-        if [[ "${cmd}" == *"run_task_workload.py"* \
-          || "${cmd}" == *"vllm.entrypoints.openai.api_server"* \
-          || "${cmd}" == *"vllm_api_server_mars.py"* \
-          || "${cmd}" == *"VLLM::EngineCore"* ]]; then
-          printf '%s ' "${pid}"
-        fi
-      done \
-    | sed 's/[[:space:]]*$//'
+  mars_gpu_compute_pids "${gpu_spec}"
 }
 
 preflight() {
@@ -219,6 +186,21 @@ PY
   fi
 }
 
+assert_fresh_workload_output() {
+  local artifact existing=""
+  for artifact in run_config.json events.jsonl traces.jsonl summary.json; do
+    [[ ! -e "${OUT_DIR}/${artifact}" ]] || die \
+      "Refusing to overwrite existing workload artifact: ${OUT_DIR}/${artifact}"
+  done
+
+  if [[ -d "${OUT_DIR}" ]]; then
+    existing="$(find "${OUT_DIR}" -mindepth 1 -maxdepth 1 -print -quit)"
+  fi
+  if ! mars_bool_true "${USE_EXISTING_VLLM}" && [[ -n "${existing}" ]]; then
+    die "Refusing to reuse non-empty OUT_DIR: ${OUT_DIR}"
+  fi
+}
+
 configure_runtime() {
   [[ -z "${TP}" ]] && TP="$(mars_infer_tp_from_devices "${CUDA_VISIBLE_DEVICES}")"
   AUTELLIX_TAIL_FCFS_AFTER_FINISHED="$(resolve_autellix_tail_threshold)"
@@ -242,6 +224,7 @@ configure_runtime() {
 
 SERVER_PID=""
 SERVER_IS_PROCESS_GROUP=0
+SERVER_LAUNCH_COMMAND=()
 CLEANUP_DONE=0
 
 cleanup() {
@@ -312,7 +295,7 @@ check_local_vllm_slot() {
     local pids
     pids="$(existing_guarded_run_pids)"
     if [[ -n "${pids}" ]]; then
-      die "Another OpenHands/vLLM run is active on GPU(s) [${GPU_GUARD_DEVICES}] (PID(s): ${pids}). Set ALLOW_CONCURRENT_RUNS=1 to bypass."
+      die "Selected GPU(s) [${GPU_GUARD_DEVICES}] are not idle (compute PID(s): ${pids}). Use free GPUs or set ALLOW_CONCURRENT_RUNS=1 explicitly."
     fi
   fi
 }
@@ -413,11 +396,104 @@ start_local_vllm() {
   else
     "${launch_cmd[@]}" >"${VLLM_LOG_PATH}" 2>&1 &
   fi
+  SERVER_LAUNCH_COMMAND=("${launch_cmd[@]}")
   SERVER_PID=$!
 
   mars_wait_for_vllm "${MARS_PYTHON}" "${BASE_URL}" 300 "${SERVER_PID}" "${VLLM_LOG_PATH}" "${REQUIRE_KV_STATS_READY}"
   echo "== vLLM ready =="
   log_kv BASE_URL "${BASE_URL}"
+}
+
+write_local_vllm_provenance() {
+  mars_bool_true "${USE_EXISTING_VLLM}" && return 0
+  [[ -f "${PROVENANCE_SCRIPT}" ]] || die "Provenance helper not found: ${PROVENANCE_SCRIPT}"
+
+  local repo_url repo_commit normalized_top_p
+  repo_url="$(git -C "${MARS_DIR}" remote get-url origin 2>/dev/null || echo local)"
+  repo_commit="$(git -C "${MARS_DIR}" rev-parse HEAD)"
+  normalized_top_p="${TOP_P:-1.0}"
+  "${MARS_PYTHON}" "${PROVENANCE_SCRIPT}" \
+    --output "${PROVENANCE_PATH}" \
+    --backend-name mars-vllm \
+    --runtime source \
+    --repo-url "${repo_url}" \
+    --ref "$(git -C "${MARS_DIR}" branch --show-current 2>/dev/null || true)" \
+    --expected-commit "${repo_commit}" \
+    --source-dir "${MARS_DIR}" \
+    --python "${MARS_PYTHON}" \
+    --include-packages false \
+    --orchestrator-python "${MARS_PYTHON}" \
+    --openhands-python "${OPENHANDS_PYTHON}" \
+    --client-source "common_runtime.sh=${SCRIPT_DIR}/common_runtime.sh" \
+    --client-source "run_openhands_qwen3_local.sh=${BASH_SOURCE[0]}" \
+    --client-source "run_task_workload.py=${OPENHANDS_RUNNER}" \
+    --client-source "command_guard.py=${MARS_DIR}/experiments/openhands/command_guard.py" \
+    --client-source "common.py=${MARS_DIR}/experiments/openhands/common.py" \
+    --client-source "llm_trace_bridge.py=${MARS_DIR}/experiments/openhands/llm_trace_bridge.py" \
+    --client-source "openhands_runner.py=${MARS_DIR}/experiments/openhands/openhands_runner.py" \
+    --client-source "request_bootstrap.py=${MARS_DIR}/experiments/openhands/request_bootstrap.py" \
+    --client-source "request_worker.py=${MARS_DIR}/experiments/openhands/request_worker.py" \
+    --client-source "sandbox_shell.sh=${MARS_DIR}/experiments/openhands/sandbox_shell.sh" \
+    --client-source "tool_trace_bridge.py=${MARS_DIR}/experiments/openhands/tool_trace_bridge.py" \
+    --client-source "trace_writer.py=${MARS_DIR}/experiments/openhands/trace_writer.py" \
+    --client-source "openai_compat_probe.py=${OPENAI_COMPAT_PROBE_SCRIPT}" \
+    --host "${VLLM_HOST}" \
+    --port "${VLLM_PORT}" \
+    --nccl-port "${VLLM_DP_MASTER_PORT:-0}" \
+    --server-log "${VLLM_LOG_PATH}" \
+    --model-path "${MODEL_PATH}" \
+    --served-model-name "${MODEL_NAME}" \
+    --model-hash-mode "${MODEL_HASH_MODE}" \
+    --tasks-path "${TASKS_PATH}" \
+    --rps "${RPS}" \
+    --max-requests "${MAX_REQUESTS}" \
+    --shuffle "${SHUFFLE}" \
+    --seed "${SEED}" \
+    --temperature "${TEMPERATURE}" \
+    --top-p "${normalized_top_p}" \
+    --max-output-tokens "${MAX_OUTPUT_TOKENS}" \
+    --llm-timeout-s "${LLM_TIMEOUT_S}" \
+    --llm-num-retries "${LLM_NUM_RETRIES}" \
+    --max-iterations "${MAX_ITERATIONS}" \
+    --emit-mode "${EMIT_MODE}" \
+    --max-workers "${MAX_WORKERS}" \
+    --cuda-visible-devices "${CUDA_VISIBLE_DEVICES}" \
+    --tp "${TP}" \
+    --dtype "${DTYPE}" \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+    --cpu-gpu "${CPU_GPU}" \
+    --cpu-tool "${CPU_TOOL}" \
+    --cpu-cores "${CPU_CORES}" \
+    --warmup-enabled "${OPENAI_COMPAT_WARMUP}" \
+    --warmup-requests "${WARMUP_REQUESTS}" \
+    --warmup-max-tokens "${WARMUP_MAX_TOKENS}" \
+    --warmup-artifact "${WARMUP_ARTIFACT}" \
+    --tool-call-parser "${TOOL_CALL_PARSER}" \
+    --auto-tool-choice-enabled "${ENABLE_AUTO_TOOL_CHOICE}" \
+    --kv-events "${KV_EVENTS}" \
+    --triton-autotune-level -1 \
+    --load-worker -1 \
+    --upstream-patched true \
+    -- "${SERVER_LAUNCH_COMMAND[@]}"
+}
+
+run_openai_compat_warmup() {
+  if ! mars_bool_true "${OPENAI_COMPAT_WARMUP}"; then
+    return 0
+  fi
+  [[ -f "${OPENAI_COMPAT_PROBE_SCRIPT}" ]] || die \
+    "OpenAI compatibility probe not found: ${OPENAI_COMPAT_PROBE_SCRIPT}"
+  echo "== Running common streaming/tool-call warmup =="
+  "${MARS_PYTHON}" "${OPENAI_COMPAT_PROBE_SCRIPT}" \
+    --base-url "${BASE_URL}" \
+    --model "${MODEL_NAME}" \
+    --api-key "${API_KEY}" \
+    --wait-timeout-s 30 \
+    --request-timeout-s "${LLM_TIMEOUT_S}" \
+    --requests "${WARMUP_REQUESTS}" \
+    --max-tokens "${WARMUP_MAX_TOKENS}" \
+    --output "${WARMUP_ARTIFACT}"
 }
 
 build_workload_command() {
@@ -528,6 +604,7 @@ run_workload() {
 
 main() {
   preflight
+  assert_fresh_workload_output
   mkdir -p "${OUT_DIR}" "${WORKSPACE_ROOT}"
   : > "${LAUNCHER_LOG_PATH}"
   : > "${WORKLOAD_LOG_PATH}"
@@ -544,6 +621,8 @@ main() {
   if ! mars_bool_true "${USE_EXISTING_VLLM}"; then
     start_local_vllm
   fi
+  write_local_vllm_provenance
+  run_openai_compat_warmup
   build_workload_command "$@"
   run_workload
 }

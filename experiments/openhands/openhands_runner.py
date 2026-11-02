@@ -10,7 +10,7 @@ from typing import Any
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 
-from common import now_s
+from common import OPENHANDS_FORCE_STRING_SERIALIZER, now_s
 from llm_trace_bridge import install_llm_trace_patch, register_llm_collector, unregister_llm_collector
 from request_bootstrap import (
     build_user_request,
@@ -106,6 +106,32 @@ def _build_tools(config: OpenHandsConfig, sdk: dict[str, Any]) -> list[Any]:
         Tool(name=FileEditorTool.name),
         Tool(name=TaskTrackerTool.name),
     ]
+
+
+def _build_llm(config: OpenHandsConfig, sdk: dict[str, Any]) -> Any:
+    """Build the common text-only OpenHands client for every backend.
+
+    OpenHands otherwise serializes text as OpenAI content-part lists whenever
+    native tool calling is active. Some conforming text-only providers accept
+    only string content. The SDK's string serializer preserves tool-call and
+    tool-result threading while joining text parts in their original order.
+    Keeping this setting common to every backend avoids a backend-side adapter.
+    """
+
+    LLM = sdk["LLM"]
+    SecretStr = sdk["SecretStr"]
+    return LLM(
+        model=_normalize_openai_compatible_model(config.model),
+        api_key=SecretStr(config.api_key),
+        base_url=config.base_url,
+        stream=True,
+        timeout=config.llm_timeout_s,
+        num_retries=config.llm_num_retries,
+        temperature=config.temperature,
+        top_p=config.top_p,
+        max_output_tokens=config.max_output_tokens,
+        force_string_serializer=OPENHANDS_FORCE_STRING_SERIALIZER,
+    )
 
 
 def _prepare_workspace_runtime_dirs(workspace_dir: Path) -> dict[str, Path]:
@@ -228,8 +254,6 @@ def run_task_request(
     sdk = _load_openhands_sdk()
     Agent = sdk["Agent"]
     Conversation = sdk["Conversation"]
-    LLM = sdk["LLM"]
-    SecretStr = sdk["SecretStr"]
     register_default_tools = sdk["register_default_tools"]
 
     install_llm_trace_patch()
@@ -252,17 +276,7 @@ def run_task_request(
     file_count = materialize_workspace_init(task, workspace_dir)
     collector.set_workspace_materialized(file_count)
 
-    llm = LLM(
-        model=_normalize_openai_compatible_model(config.model),
-        api_key=SecretStr(config.api_key),
-        base_url=config.base_url,
-        stream=True,
-        timeout=config.llm_timeout_s,
-        num_retries=config.llm_num_retries,
-        temperature=config.temperature,
-        top_p=config.top_p,
-        max_output_tokens=config.max_output_tokens,
-    )
+    llm = _build_llm(config, sdk)
     register_llm_collector(llm, collector)
 
     conversation = None
@@ -283,6 +297,7 @@ def run_task_request(
             "runtime_dir": runtime_env.get("MARS_RUNTIME_DIR"),
             "artifact_dir": runtime_env.get("MARS_ARTIFACT_DIR"),
             "openhands_default_terminal": _env_flag("MARS_OPENHANDS_DEFAULT_TERMINAL"),
+            "force_string_serializer": OPENHANDS_FORCE_STRING_SERIALIZER,
             "terminal_type": config.terminal_type,
         }
     )

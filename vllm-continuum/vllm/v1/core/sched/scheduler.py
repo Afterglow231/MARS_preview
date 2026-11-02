@@ -10,6 +10,7 @@ import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, Optional, Union, Tuple
 
 from vllm.config import VllmConfig
@@ -24,6 +25,10 @@ from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
+from vllm.v1.core.sched.lightllm_policy import (
+    LIGHTLLM_UPSTREAM_COMMIT, LightLLMAdmissionConfig,
+    LightLLMAdmissionController, LightLLMAdmissionDecision,
+    LightLLMRequestState)
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
 from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
@@ -31,7 +36,7 @@ from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -42,6 +47,16 @@ from vllm.forward_step_trace import enabled as forward_step_trace_enabled
 from vllm.forward_step_trace import next_step_id as next_forward_step_id
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _LightLLMWaitingPreview:
+    """Router admission plus model-side prefix classification for one head."""
+
+    computed_blocks: KVCacheBlocks
+    cache_hit_tokens: int
+    block_signature: tuple[tuple[int, Any], ...]
+    is_prefill: bool
 
 
 class Scheduler(SchedulerInterface):
@@ -134,6 +149,8 @@ class Scheduler(SchedulerInterface):
             self.policy = SchedulingPolicy.INFERCEPT
         elif self.scheduler_config.policy == "infercept_swap":
             self.policy = SchedulingPolicy.INFERCEPT_SWAP
+        elif self.scheduler_config.policy == "lightllm":
+            self.policy = SchedulingPolicy.LIGHTLLM
         elif self.scheduler_config.policy == "mars":
             self.policy = SchedulingPolicy.MARS
         else:
@@ -242,7 +259,302 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
         )
+
+        self._lightllm_controller: Optional[
+            LightLLMAdmissionController] = None
+        self._lightllm_chunk_size = 0
+        self._lightllm_deferred: dict[
+            str, _LightLLMWaitingPreview] = {}
+        if self.policy == SchedulingPolicy.LIGHTLLM:
+            self._init_lightllm_policy()
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+
+    def _init_lightllm_policy(self) -> None:
+        """Initialize the scheduler-only LightLLM policy port.
+
+        The port intentionally supports the text-generation configuration used
+        by the vLLM+tool baseline.  Failing fast for execution modes whose KV
+        accounting differs from the pinned LightLLM policy avoids silently
+        presenting a modified algorithm as that baseline.
+        """
+
+        unsupported: list[str] = []
+        if self.scheduler_config.runner_type != "generate":
+            unsupported.append(
+                f"runner_type={self.scheduler_config.runner_type}")
+        if self.is_encoder_decoder:
+            unsupported.append("encoder-decoder models")
+        if self.scheduler_config.is_multimodal_model:
+            unsupported.append("multimodal models")
+        if len(self.kv_cache_config.kv_cache_groups) != 1:
+            unsupported.append("multiple KV-cache groups")
+        elif not isinstance(
+                self.kv_cache_config.kv_cache_groups[0].kv_cache_spec,
+                FullAttentionSpec):
+            unsupported.append("non-full-attention KV cache")
+        if self.vllm_config.speculative_config is not None:
+            unsupported.append("speculative decoding")
+        if self.connector is not None:
+            unsupported.append("KV connectors")
+        if self.lora_config is not None:
+            unsupported.append("LoRA adapters")
+        if self.scheduler_config.async_scheduling:
+            unsupported.append("async scheduling")
+        if self.dcp_world_size != 1:
+            unsupported.append("decode-context parallelism")
+        if self.parallel_config.pipeline_parallel_size != 1:
+            unsupported.append("pipeline parallelism")
+        if self.parallel_config.data_parallel_size != 1:
+            unsupported.append("data parallelism")
+        if not self.scheduler_config.chunked_prefill_enabled:
+            unsupported.append("chunked prefill disabled")
+        if self.scheduler_config.long_prefill_token_threshold != 0:
+            unsupported.append("vLLM long-prefill threshold")
+        if unsupported:
+            raise ValueError(
+                "The lightllm scheduler-policy port supports only synchronous "
+                "text generation with one KV-cache group and no speculative "
+                "decoding/KV connector; unsupported: "
+                + ", ".join(unsupported))
+
+        configured_chunk = self.scheduler_config.lightllm_chunked_prefill_size
+        self._lightllm_chunk_size = int(
+            configured_chunk
+            if configured_chunk is not None
+            else max(1, self.max_num_scheduled_tokens // 2))
+        max_total_tokens = (
+            self.kv_cache_manager.block_pool.num_gpu_blocks - 1
+        ) * self.block_size
+        self._lightllm_controller = LightLLMAdmissionController(
+            config=LightLLMAdmissionConfig(
+                router_token_ratio=(
+                    self.scheduler_config.lightllm_router_token_ratio),
+                router_max_wait_tokens=(
+                    self.scheduler_config.lightllm_router_max_wait_tokens),
+                chunk_size=self._lightllm_chunk_size,
+                batch_max_tokens=self.max_num_scheduled_tokens,
+            ),
+            max_total_tokens=max_total_tokens,
+            running_max_req_size=self.max_num_running_reqs,
+        )
+        logger.info(
+            "Initialized LightLLM scheduler-policy port: commit=%s, "
+            "capacity_tokens=%d, batch_max_tokens=%d, chunk_size=%d, "
+            "router_token_ratio=%.3f, router_max_wait_tokens=%d",
+            LIGHTLLM_UPSTREAM_COMMIT,
+            max_total_tokens,
+            self.max_num_scheduled_tokens,
+            self._lightllm_chunk_size,
+            self.scheduler_config.lightllm_router_token_ratio,
+            self.scheduler_config.lightllm_router_max_wait_tokens,
+        )
+
+    @staticmethod
+    def _lightllm_request_state(
+        request: Request,
+        *,
+        kv_len: Optional[int] = None,
+    ) -> LightLLMRequestState:
+        sampling_params = request.sampling_params
+        return LightLLMRequestState(
+            request_id=request.request_id,
+            input_len=request.num_prompt_tokens,
+            output_len=request.num_output_tokens,
+            kv_len=(request.num_computed_tokens
+                    if kv_len is None else kv_len),
+            max_new_tokens=request.max_tokens,
+            ignore_eos=bool(sampling_params and sampling_params.ignore_eos),
+        )
+
+    def _lightllm_active_states(self) -> list[LightLLMRequestState]:
+        return [
+            self._lightllm_request_state(request) for request in self.running
+        ]
+
+    def _lightllm_active_kv_tokens(self) -> int:
+        block_pool = self.kv_cache_manager.block_pool
+        used_blocks = ((block_pool.num_gpu_blocks - 1)
+                       - block_pool.get_num_free_blocks())
+        return used_blocks * self.block_size
+
+    def _lightllm_evaluate_candidate(
+        self,
+        candidate: Request,
+        active_states: Optional[list[LightLLMRequestState]] = None,
+        active_kv_tokens: Optional[int] = None,
+    ) -> LightLLMAdmissionDecision:
+        controller = self._lightllm_controller
+        assert controller is not None
+        if active_states is None:
+            active_states = self._lightllm_active_states()
+        if active_kv_tokens is None:
+            active_kv_tokens = self._lightllm_active_kv_tokens()
+        return controller.evaluate(
+            active_states,
+            self._lightllm_request_state(candidate),
+            active_kv_tokens=active_kv_tokens,
+        )
+
+    @staticmethod
+    def _lightllm_block_signature(
+        blocks: KVCacheBlocks,
+    ) -> tuple[tuple[int, Any], ...]:
+        """Identify cached blocks so an intervening eviction is detectable."""
+
+        return tuple(
+            (block.block_id, block.block_hash)
+            for group in blocks.blocks
+            for block in group
+        )
+
+    def _lightllm_reserve_prefix_blocks(
+        self,
+        preview: _LightLLMWaitingPreview,
+    ) -> None:
+        """Hold a router-admitted prefix hit until vLLM executes it."""
+
+        if preview.block_signature:
+            self.kv_cache_manager.block_pool.touch(
+                preview.computed_blocks.blocks)
+
+    def _lightllm_release_prefix_blocks(
+        self,
+        preview: _LightLLMWaitingPreview,
+    ) -> None:
+        """Drop the private hold immediately before allocator ownership."""
+
+        if not preview.block_signature:
+            return
+        ordered_blocks = [
+            block
+            for group in preview.computed_blocks.blocks
+            for block in group
+        ]
+        self.kv_cache_manager.block_pool.free_blocks(
+            reversed(ordered_blocks))
+
+    def _lightllm_drop_deferred(self, request_id: str) -> None:
+        preview = self._lightllm_deferred.pop(request_id, None)
+        if preview is not None:
+            self._lightllm_release_prefix_blocks(preview)
+
+    def _lightllm_prepare_step(
+        self,
+    ) -> tuple[
+        bool,
+        dict[str, _LightLLMWaitingPreview],
+        set[str],
+    ]:
+        """Preview one upstream-style router batch and model run class.
+
+        LightLLM admits an FCFS batch using each waiting request's KV state
+        *before* radix lookup.  The model then applies prefix matching and
+        classifies a request as decode when only its final token remains.
+        vLLM normally performs lookup later in ``schedule``; this read-only
+        preview preserves that two-stage ordering and lets aggressive
+        prefill/decode arbitration see full-prefix hits correctly.
+        """
+
+        controller = self._lightllm_controller
+        assert controller is not None
+        waiting_requests = list(self.waiting)
+        active_states = self._lightllm_active_states()
+        # Requests admitted by an earlier router preview but not selected by
+        # that model step are active in upstream LightLLM. They remain in
+        # vLLM's waiting container only because vLLM cannot publish a new
+        # request to workers without scheduling at least one token.
+        for request in waiting_requests:
+            deferred = self._lightllm_deferred.get(request.request_id)
+            if deferred is None:
+                continue
+            active_states.append(
+                self._lightllm_request_state(
+                    request,
+                    kv_len=(request.num_computed_tokens
+                            + deferred.cache_hit_tokens),
+                ))
+        active_kv_tokens = self._lightllm_active_kv_tokens()
+        provisional_states = list(active_states)
+        waiting_preview = dict(self._lightllm_deferred)
+
+        prefill_tokens = 0
+        has_model_prefill = False
+        selected_prefill_ids: set[str] = set()
+
+        def classify_for_model(state: LightLLMRequestState) -> None:
+            nonlocal prefill_tokens, has_model_prefill
+            if state.is_decode_step():
+                return
+            need_tokens = state.decode_need_tokens(
+                self._lightllm_chunk_size)
+            # Upstream's model-side prefill packer skips a request whose full
+            # chunk does not fit the batch; it does not shrink that chunk.
+            if prefill_tokens + need_tokens <= self.max_num_scheduled_tokens:
+                prefill_tokens += need_tokens
+                has_model_prefill = True
+                assert state.request_id is not None
+                selected_prefill_ids.add(state.request_id)
+
+        for state in active_states:
+            classify_for_model(state)
+
+        for request in waiting_requests:
+            if request.request_id in self._lightllm_deferred:
+                continue
+            if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                break
+            if request.status == RequestStatus.WAITING_FOR_FSM:
+                structured_output_req = request.structured_output_request
+                if not (structured_output_req and
+                        structured_output_req.grammar):
+                    break
+
+            admission_state = self._lightllm_request_state(request)
+            admission = controller.evaluate(
+                provisional_states,
+                admission_state,
+                active_kv_tokens=active_kv_tokens,
+            )
+            if not admission.admitted:
+                break
+
+            if request.num_computed_tokens == 0:
+                computed_blocks, cache_hit_tokens = (
+                    self.kv_cache_manager.get_computed_blocks(request))
+            else:
+                computed_blocks = (
+                    self.kv_cache_manager.create_empty_block_list())
+                cache_hit_tokens = 0
+            effective_computed_tokens = (
+                request.num_computed_tokens + cache_hit_tokens)
+            model_state = self._lightllm_request_state(
+                request,
+                kv_len=effective_computed_tokens,
+            )
+            is_prefill = not model_state.is_decode_step()
+            preview = _LightLLMWaitingPreview(
+                computed_blocks=computed_blocks,
+                cache_hit_tokens=cache_hit_tokens,
+                block_signature=self._lightllm_block_signature(
+                    computed_blocks),
+                is_prefill=is_prefill,
+            )
+            self._lightllm_reserve_prefix_blocks(preview)
+            self._lightllm_deferred[request.request_id] = preview
+            waiting_preview[request.request_id] = preview
+            provisional_states.append(admission_state)
+            classify_for_model(model_state)
+
+        return (
+            has_model_prefill,
+            waiting_preview,
+            selected_prefill_ids,
+        )
+
+    def _lightllm_prefill_step(self) -> bool:
+        """Return whether this model step should prioritize prefill work."""
+
+        return self._lightllm_prepare_step()[0]
 
     def _make_forward_step_profile_meta(
         self,
@@ -297,6 +609,7 @@ class Scheduler(SchedulerInterface):
         spec_decode_tokens = sum(
             len(tokens) for tokens in scheduled_spec_decode_tokens.values())
         policy = getattr(self.policy, "value", str(self.policy))
+        running_queue_len, waiting_queue_len = self.get_request_counts()
         meta: dict[str, Any] = {
             "schema": "stamp_forward_step_v1",
             "backend": "vllm",
@@ -306,8 +619,8 @@ class Scheduler(SchedulerInterface):
             "policy": str(policy),
             "batch_mode": batch_mode,
             "scheduled_req_count": len(num_scheduled_tokens),
-            "running_queue_len": len(self.running),
-            "waiting_queue_len": len(self.waiting),
+            "running_queue_len": running_queue_len,
+            "waiting_queue_len": waiting_queue_len,
             "total_scheduled_tokens": int(total_num_scheduled_tokens),
             "prefill_req_count": int(prefill_reqs),
             "prefill_token_count": int(prefill_tokens),
@@ -891,10 +1204,30 @@ class Scheduler(SchedulerInterface):
             if self.running:
                 self._autellix_reorder_running()
 
+        # Preview LightLLM's router admission before vLLM prefix lookup, then
+        # use the model-side effective KV lengths for aggressive prefill/decode
+        # arbitration. The preview is also reused by the waiting scan below.
+        lightllm_waiting_preview: dict[
+            str, _LightLLMWaitingPreview] = {}
+        lightllm_selected_prefill_ids: set[str] = set()
+        lightllm_prefill_step = False
+        if self.policy == SchedulingPolicy.LIGHTLLM:
+            (
+                lightllm_prefill_step,
+                lightllm_waiting_preview,
+                lightllm_selected_prefill_ids,
+            ) = self._lightllm_prepare_step()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if (lightllm_prefill_step
+                    and request.request_id not in
+                    lightllm_selected_prefill_ids):
+                req_index += 1
+                continue
 
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
@@ -912,6 +1245,12 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens,
                 self.max_model_len - 1 - request.num_computed_tokens)
+
+            if (self.policy == SchedulingPolicy.LIGHTLLM
+                    and request.num_computed_tokens <
+                    request.num_prompt_tokens):
+                num_new_tokens = min(num_new_tokens,
+                                     self._lightllm_chunk_size)
 
             mars_quantum = None
             if self.policy == SchedulingPolicy.MARS:
@@ -1173,7 +1512,8 @@ class Scheduler(SchedulerInterface):
                 if len(self.running) == self.max_num_running_reqs:
                     break
                 
-                if self.policy == SchedulingPolicy.FCFS:
+                if self.policy in (SchedulingPolicy.FCFS,
+                                   SchedulingPolicy.LIGHTLLM):
                     request = self.waiting.peek_request()
                 elif self.policy == SchedulingPolicy.PRIORITY:
                     request = self.waiting.peek_request()
@@ -1200,6 +1540,8 @@ class Scheduler(SchedulerInterface):
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id)
+                        if self.policy == SchedulingPolicy.LIGHTLLM:
+                            break
                         if self.policy in (SchedulingPolicy.CONTINUUM,
                                            SchedulingPolicy.CONTINUUM_DY):
                             self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector)
@@ -1215,6 +1557,8 @@ class Scheduler(SchedulerInterface):
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
                     else:
+                        if self.policy == SchedulingPolicy.LIGHTLLM:
+                            break
                         if self.policy in (SchedulingPolicy.CONTINUUM,
                                            SchedulingPolicy.CONTINUUM_DY):
                             self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector)
@@ -1233,15 +1577,89 @@ class Scheduler(SchedulerInterface):
                     skipped_waiting_requests.prepend_request(request)
                     continue
 
+                lightllm_computed_blocks: Optional[KVCacheBlocks] = None
+                lightllm_cache_hit_tokens = 0
+                lightllm_deferred_preview: Optional[
+                    _LightLLMWaitingPreview] = None
+                if self.policy == SchedulingPolicy.LIGHTLLM:
+                    candidate_preview = lightllm_waiting_preview.get(
+                        request.request_id)
+                    # Absence means the frozen upstream-style FCFS preview
+                    # rejected this head (or stopped at an unavailable head).
+                    if candidate_preview is None:
+                        break
+                    lightllm_computed_blocks = (
+                        candidate_preview.computed_blocks)
+                    lightllm_cache_hit_tokens = (
+                        candidate_preview.cache_hit_tokens)
+
+                    # Running-request allocations may evict an unreferenced
+                    # prefix block after the preview. Re-query only when its
+                    # identity changed, then classify from the actual hit.
+                    cache_preview_stale = (
+                        self._lightllm_block_signature(
+                            lightllm_computed_blocks)
+                        != candidate_preview.block_signature)
+                    actual_is_prefill = candidate_preview.is_prefill
+                    if cache_preview_stale:
+                        self._lightllm_drop_deferred(request.request_id)
+                        (lightllm_computed_blocks,
+                         lightllm_cache_hit_tokens) = (
+                             self.kv_cache_manager.get_computed_blocks(
+                                 request))
+                        effective_state = self._lightllm_request_state(
+                            request,
+                            kv_len=(request.num_computed_tokens
+                                    + lightllm_cache_hit_tokens),
+                        )
+                        actual_is_prefill = (
+                            not effective_state.is_decode_step())
+                        candidate_preview = _LightLLMWaitingPreview(
+                            computed_blocks=lightllm_computed_blocks,
+                            cache_hit_tokens=lightllm_cache_hit_tokens,
+                            block_signature=(
+                                self._lightllm_block_signature(
+                                    lightllm_computed_blocks)),
+                            is_prefill=actual_is_prefill,
+                        )
+                        self._lightllm_reserve_prefix_blocks(
+                            candidate_preview)
+                        self._lightllm_deferred[
+                            request.request_id] = candidate_preview
+                        lightllm_waiting_preview[
+                            request.request_id] = candidate_preview
+                    selected_for_model_step = (
+                        actual_is_prefill
+                        and request.request_id in
+                        lightllm_selected_prefill_ids
+                        if lightllm_prefill_step
+                        else not actual_is_prefill)
+                    if not selected_for_model_step:
+                        # The request was router-admitted, but upstream's
+                        # aggressive model step executes only the selected
+                        # prefill/decode class. Temporarily scan past it while
+                        # restoring strict FCFS order after this step.
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.add_request(request)
+                        continue
+                    lightllm_deferred_preview = candidate_preview
+
                 num_external_computed_tokens = 0
                 load_kv_async = False
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = \
-                        self.kv_cache_manager.get_computed_blocks(
-                            request)
+                    if self.policy == SchedulingPolicy.LIGHTLLM:
+                        assert lightllm_computed_blocks is not None
+                        new_computed_blocks = lightllm_computed_blocks
+                        num_new_local_computed_tokens = (
+                            lightllm_cache_hit_tokens)
+                    else:
+                        (new_computed_blocks,
+                         num_new_local_computed_tokens) = (
+                             self.kv_cache_manager.get_computed_blocks(
+                                 request))
 
                     # NOTE (Hanchen) The logic here is that we will see if the connector can get the tokens. 
                     # If it can, we will use them.
@@ -1299,6 +1717,12 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
+
+                    if (self.policy == SchedulingPolicy.LIGHTLLM
+                            and num_computed_tokens <
+                            request.num_prompt_tokens):
+                        num_new_tokens = min(num_new_tokens,
+                                             self._lightllm_chunk_size)
 
                     mars_quantum_waiting = None
                     autellix_quantum_waiting = None
@@ -1367,6 +1791,13 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens = 0
 
                 # Allocate slots after the policy has selected this request.
+                if self.policy == SchedulingPolicy.LIGHTLLM:
+                    assert lightllm_deferred_preview is not None
+                    removed_preview = self._lightllm_deferred.pop(
+                        request.request_id, None)
+                    assert removed_preview is lightllm_deferred_preview
+                    self._lightllm_release_prefix_blocks(
+                        lightllm_deferred_preview)
                 attempt_tokens = num_new_tokens
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
@@ -1393,6 +1824,12 @@ class Scheduler(SchedulerInterface):
                     break
 
                 if new_blocks is None:
+                    if (self.policy == SchedulingPolicy.LIGHTLLM
+                            and lightllm_deferred_preview is not None):
+                        self._lightllm_reserve_prefix_blocks(
+                            lightllm_deferred_preview)
+                        self._lightllm_deferred[
+                            request.request_id] = lightllm_deferred_preview
                     #print(f"Request {request.request_id} cannot be scheduled due to no slots")
                     # The request cannot be scheduled.
                     # TODO (Hanchen) need to add preemption logic here for CONTINUUM
@@ -1468,7 +1905,7 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
-                
+
                 if self.policy == SchedulingPolicy.MARS:
                     # Updates MARS feedback state
                     self._mars_on_scheduled(
@@ -1521,6 +1958,9 @@ class Scheduler(SchedulerInterface):
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
+        if self.policy == SchedulingPolicy.LIGHTLLM:
+            assert (len(self.running) + len(self._lightllm_deferred)
+                    <= self.max_num_running_reqs)
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
@@ -2079,6 +2519,10 @@ class Scheduler(SchedulerInterface):
             # MARS has overflow requests.
             return len(self.running), len(self.waiting) + len(
                 self._mars_overflow)
+        if self.policy == SchedulingPolicy.LIGHTLLM:
+            deferred_count = len(self._lightllm_deferred)
+            return (len(self.running) + deferred_count,
+                    len(self.waiting) - deferred_count)
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
@@ -2172,6 +2616,16 @@ class Scheduler(SchedulerInterface):
 
     def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
         assert request.is_finished()
+        if self.policy == SchedulingPolicy.LIGHTLLM:
+            self._lightllm_drop_deferred(request.request_id)
+        if (self.policy == SchedulingPolicy.LIGHTLLM
+                and request.status in (
+                    RequestStatus.FINISHED_STOPPED,
+                    RequestStatus.FINISHED_LENGTH_CAPPED,
+                )):
+            controller = self._lightllm_controller
+            assert controller is not None
+            controller.update_output_ema(request.num_output_tokens)
         self.tool_call_estimator.request_finished(request)
         self.interception_recorder.request_finished(request)
 
@@ -2339,11 +2793,10 @@ class Scheduler(SchedulerInterface):
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
+        num_running_reqs, num_waiting_reqs = self.get_request_counts()
         return SchedulerStats(
-            num_running_reqs=len(self.running),
-            num_waiting_reqs=(len(self.waiting) + len(self._mars_overflow)
-                              if self.policy == SchedulingPolicy.MARS else
-                              len(self.waiting)),
+            num_running_reqs=num_running_reqs,
+            num_waiting_reqs=num_waiting_reqs,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             spec_decoding_stats=spec_decoding_stats,
@@ -2367,6 +2820,9 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        if self.policy == SchedulingPolicy.LIGHTLLM:
+            for request_id in tuple(self._lightllm_deferred):
+                self._lightllm_drop_deferred(request_id)
         try:
             self.interception_recorder.print_history()
         except Exception as exc:
