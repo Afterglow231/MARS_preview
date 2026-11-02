@@ -673,11 +673,13 @@ class Scheduler(SchedulerInterface):
             if job_entry_time > latest_entry_time:
                 latest_entry_time = job_entry_time
                 latest_request = req
-        
+
         if latest_request is not None:
             self.running.remove(latest_request)
             return latest_request, False
-    
+
+        raise IndexError("pop from empty running queue")
+
     def pin_request(self, request: Request, length_of_pin: float) -> None:
         self.interception_recorder.request_pinned(request)
         self.pinned_requests.append((request, time.time() + length_of_pin))

@@ -482,8 +482,19 @@ class ToolCallEstimator:
             self.job_to_history[history_key].append({"arrival_time": request.arrival_time})
             return
 
-        last_record = self.job_to_history[history_key][-1]
+        history = self.job_to_history[history_key]
+        last_record = history[-1]
         derived_last_func_call = last_record.get("func_call")
+        if "departure_time" not in last_record:
+            # OpenCode can overlap or retry requests with the same job_id
+            # before the prior request finishes, leaving an arrival-only
+            # record. Reuse the most recent completed tool call; no execution
+            # time is sampled because this arrival has no matching departure.
+            derived_last_func_call = next(
+                (record.get("func_call") for record in reversed(history)
+                 if "departure_time" in record),
+                None,
+            )
         if request.last_func_call is None:
             request.last_func_call = derived_last_func_call
         elif derived_last_func_call is not None and request.last_func_call != derived_last_func_call:
