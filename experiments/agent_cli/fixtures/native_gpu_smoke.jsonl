@@ -1,0 +1,1 @@
+{"schema":"mas_task_v1","request_id":"native-gpu-smoke","benchmark":"repobench","task_id":"native-gpu-smoke","payload":{"text":"Use a shell tool to read EVIDENCE.txt. Then report the exact marker it contains. Do not answer before using the tool."},"workspace_init":[{"path":"EVIDENCE.txt","content":"MARS_NATIVE_FRONTEND_OK\n"}]}
