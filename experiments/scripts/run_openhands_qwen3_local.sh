@@ -15,7 +15,7 @@ OPENHANDS_PYTHON="${OPENHANDS_PYTHON:-$(mars_default_openhands_python "${HOST_HO
 OPENHANDS_RUNNER="${MARS_DIR}/experiments/openhands/run_task_workload.py"
 
 # Resources.
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CUDA_VISIBLE_DEVICES
 
 # CPU_GPU and CPU_TOOL should not overlap with each other

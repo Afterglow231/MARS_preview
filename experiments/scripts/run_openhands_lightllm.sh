@@ -47,7 +47,7 @@ LIGHTLLM_PYTHON="${LIGHTLLM_PYTHON:-${LIGHTLLM_ENV_DIR}/bin/python}"
 # maintained MARS OpenHands launcher and make sampling limits explicit.
 MARS_PYTHON="${MARS_PYTHON:-$(mars_default_python "${HOST_HOME}/miniconda3/envs/mars/bin/python")}"
 OPENHANDS_PYTHON="${OPENHANDS_PYTHON:-$(mars_default_openhands_python "${HOST_HOME}")}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 CPU_TOOL="${CPU_TOOL:-16-23}"
 CPU_GPU="${CPU_GPU:-0-1}"
 CPU_CORES="${CPU_CORES:-${CPU_GPU},${CPU_TOOL}}"

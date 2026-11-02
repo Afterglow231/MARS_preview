@@ -4,7 +4,7 @@ set -euo pipefail
 # Run the bundled replay workload with the MARS-modified vLLM engine.
 # Configure via environment variables; CLI args are forwarded to run_experiment.py.
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CUDA_VISIBLE_DEVICES
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
