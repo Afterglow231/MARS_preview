@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Literal, Optional, overload
 
@@ -100,6 +102,11 @@ class KVCacheManager:
         self.log_stats = log_stats
         # FIXME: make prefix cache stats conditional on log_stats
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
+        # Concur telemetry is intentionally independent of the periodic vLLM
+        # logger, whose make_prefix_cache_stats() call resets its counters.
+        # Each entry is (monotonic timestamp, queried tokens, cache-hit tokens).
+        self._recent_prefix_cache_lookups: deque[tuple[float, int, int]] = deque(
+            maxlen=4096)
 
         self.block_size: Optional[int] = None
         if self.enable_caching:
@@ -150,6 +157,39 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    def get_recent_prefix_cache_stats(
+            self, window_s: float = 10.0) -> dict[str, object]:
+        """Return a non-destructive rolling prefix-cache hit-rate snapshot.
+
+        A ``None`` hit rate means no cache lookup was observed in the recent
+        window (or prefix caching is disabled).  Callers must preserve that
+        distinction: treating unavailable telemetry as a zero hit rate can
+        spuriously trigger Concur's multiplicative decrease.
+        """
+        if not self.enable_caching:
+            return {
+                "prefix_cache_queries": 0,
+                "prefix_cache_hits": 0,
+                "prefix_cache_hit_rate": None,
+                "prefix_cache_window_s": float(window_s),
+            }
+
+        now = time.monotonic()
+        cutoff = now - max(0.0, float(window_s))
+        while (self._recent_prefix_cache_lookups
+               and self._recent_prefix_cache_lookups[0][0] < cutoff):
+            self._recent_prefix_cache_lookups.popleft()
+
+        queries = sum(item[1] for item in self._recent_prefix_cache_lookups)
+        hits = sum(item[2] for item in self._recent_prefix_cache_lookups)
+        return {
+            "prefix_cache_queries": int(queries),
+            "prefix_cache_hits": int(hits),
+            "prefix_cache_hit_rate": (
+                float(hits) / float(queries) if queries > 0 else None),
+            "prefix_cache_window_s": float(window_s),
+        }
+
     def get_computed_blocks(self,
                             request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
@@ -180,6 +220,12 @@ class KVCacheManager:
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(request.block_hashes,
                                                     max_cache_hit_length))
+
+        self._recent_prefix_cache_lookups.append((
+            time.monotonic(),
+            int(request.num_tokens),
+            int(num_new_computed_tokens),
+        ))
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -324,6 +370,8 @@ class KVCacheManager:
         """
         if not self.block_pool.reset_prefix_cache():
             return False
+
+        self._recent_prefix_cache_lookups.clear()
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True

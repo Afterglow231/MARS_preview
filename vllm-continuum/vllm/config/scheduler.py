@@ -30,6 +30,8 @@ SchedulerPolicy = Literal[
     "continuum_dy",
     "autellix",
     "infercept",
+    "infercept_swap",
+    "lightllm",
     "mars",
 ]
 
@@ -143,12 +145,34 @@ class SchedulerConfig:
     attained service with discretized priority queues and anti-starvation.\n
     - "infercept" means an intercept-aware scheduler that makes KV retainment
     decisions around tool-call interceptions.\n
+    - "infercept_swap" means InferCept with an LMCache-backed swap option:
+    tool-call KV can be evicted, preserved on GPU, or saved to LMCache and
+    later restored, depending on the cost model.\n
+    - "lightllm" means the scheduler-isolation port of LightLLM's default
+    chunked-prefill policy: strict FCFS admission, peak KV-token estimation,
+    output-length EMA, and prefill-first arbitration. The execution engine,
+    paged KV cache, and preemption mechanism remain vLLM's; use the separate
+    lightllm_native OpenHands baseline for full-system LightLLM results.\n
     - "mars" means MARS scheduling: an adaptive co-scheduling policy for
     heterogeneous agentic workloads. It coordinates GPU inference and CPU
     tool execution under coupled resource pressure, decouples admission from
     execution with an adaptive window, prioritizes latency-sensitive
     continuations, mitigates long-prefill head-of-line blocking, and preserves
     KV state when warm resumption shortens the end-to-end critical path."""
+
+    lightllm_router_token_ratio: float = 0.85
+    """KV usage ratio at which the LightLLM policy switches from its EMA
+    output estimate to the request's full maximum output length. This matches
+    LightLLM normal-mode commit 5d59e490."""
+
+    lightllm_router_max_wait_tokens: int = 1
+    """Decode-wait lifetime factor used by LightLLM's admission estimator."""
+
+    lightllm_chunked_prefill_size: Optional[int] = None
+    """Optional LightLLM prefill chunk override. By default this is derived as
+    ``max_num_batched_tokens // 2``, exactly as in the pinned upstream policy.
+    The admission budget uses the existing ``max_num_batched_tokens`` setting
+    so every in-process scheduler baseline retains the same execution limit."""
 
     autellix_tail_fcfs_after_finished: int = 0
     """
@@ -210,6 +234,14 @@ class SchedulerConfig:
         return hash_str
 
     def __post_init__(self) -> None:
+        if not 0.0 <= self.lightllm_router_token_ratio <= 1.0:
+            raise ValueError("lightllm_router_token_ratio must be in [0, 1]")
+        if self.lightllm_router_max_wait_tokens < 0:
+            raise ValueError("lightllm_router_max_wait_tokens must be >= 0")
+        if (self.lightllm_chunked_prefill_size is not None
+                and self.lightllm_chunked_prefill_size <= 0):
+            raise ValueError("lightllm_chunked_prefill_size must be positive")
+
         if self.max_model_len is None:
             self.max_model_len = 8192
 

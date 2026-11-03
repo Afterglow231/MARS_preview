@@ -67,11 +67,17 @@ class SandboxShellTest(unittest.TestCase):
             local_inputs.mkdir(parents=True)
             asset = local_inputs / "asset.txt"
             asset.write_text("input\n", encoding="utf-8")
+            foreign_asset = local_inputs / "foreign.txt"
+            foreign_asset.write_text("secret\n", encoding="utf-8")
 
             read_proc = _run_guarded_shell(
                 base,
-                'cat "$MARS_LOCAL_INPUTS_DIR/asset.txt"',
-                extra_env={"MARS_LOCAL_INPUTS_DIR": str(local_inputs)},
+                'cat "$MARS_LOCAL_INPUTS_DIR/asset.txt"; '
+                'test ! -e "$MARS_LOCAL_INPUTS_DIR/foreign.txt"',
+                extra_env={
+                    "MARS_LOCAL_INPUTS_DIR": str(local_inputs),
+                    "MARS_REQUEST_READONLY_PATHS": str(asset),
+                },
             )
             self.assertEqual(read_proc.returncode, 0, read_proc.stderr)
             self.assertEqual(read_proc.stdout, "input\n")
@@ -79,10 +85,26 @@ class SandboxShellTest(unittest.TestCase):
             write_proc = _run_guarded_shell(
                 base,
                 'printf changed > "$MARS_LOCAL_INPUTS_DIR/asset.txt"',
-                extra_env={"MARS_LOCAL_INPUTS_DIR": str(local_inputs)},
+                extra_env={
+                    "MARS_LOCAL_INPUTS_DIR": str(local_inputs),
+                    "MARS_REQUEST_READONLY_PATHS": str(asset),
+                },
             )
             self.assertNotEqual(write_proc.returncode, 0)
             self.assertEqual(asset.read_text(encoding="utf-8"), "input\n")
+
+    def test_hides_host_process_namespace(self) -> None:
+        host_process = subprocess.Popen(["sleep", "30"])
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                proc = _run_guarded_shell(
+                    Path(tmp),
+                    f"test ! -e /proc/{host_process.pid}",
+                )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        finally:
+            host_process.terminate()
+            host_process.wait(timeout=5)
 
 
 if __name__ == "__main__":

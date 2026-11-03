@@ -23,6 +23,8 @@ class SchedulingPolicy(Enum):
     CONTINUUM_DY = "continuum_dy"
     AUTELLIX = "autellix"
     INFERCEPT = "infercept"
+    INFERCEPT_SWAP = "infercept_swap"
+    LIGHTLLM = "lightllm"
     MARS = "mars"
 
 class RequestQueue(ABC):
@@ -419,7 +421,9 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
         return ContinuumRequestQueue()
     elif policy == SchedulingPolicy.AUTELLIX:
         return AutellixRequestQueue()
-    elif policy == SchedulingPolicy.INFERCEPT:
+    elif policy in (SchedulingPolicy.INFERCEPT,
+                    SchedulingPolicy.INFERCEPT_SWAP,
+                    SchedulingPolicy.LIGHTLLM):
         return FCFSRequestQueue()
     elif policy == SchedulingPolicy.MARS:
         return MarsRequestQueue()

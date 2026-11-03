@@ -12,13 +12,34 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+OPENHANDS_FORCE_STRING_SERIALIZER = True
+
 MARS_REPO_ROOT = Path(__file__).resolve().parents[2]
-BENCHMARK_ROOT = MARS_REPO_ROOT / "benchmark"
+# A workload can be launched from this MARS checkout while immutable benchmark
+# assets live in another checkout. Honor the launcher's explicit root before
+# relocating embedded workload paths.
+BENCHMARK_ROOT = Path(
+    os.environ.get("MARS_BENCHMARK_ROOT", str(MARS_REPO_ROOT / "benchmark"))
+).expanduser().resolve(strict=False)
+SWEBENCH_CACHE_ROOT = Path(
+    os.environ.get(
+        "MARS_SWEBENCH_CACHE_ROOT",
+        str(Path.home() / "models" / "swebench_repo_cache"),
+    )
+).expanduser().resolve(strict=False)
 _MARS_BENCHMARK_PREFIX_RE = re.compile(r"/[^\"'\s]*/MARS/benchmark/")
+_SWEBENCH_CACHE_PREFIX_RE = re.compile(
+    r"/[^\"'\s]*/models/swebench_repo_cache(?=/|$)"
+)
+_ABSOLUTE_GIT_TASK_BENCH_RE = re.compile(r"/[^\"'\s]*/GitTaskBench(?=/|$)")
 _GIT_TASK_BENCH_ALIAS_RE = re.compile(r"(?<!benchmark)/GitTaskBench(?=/|$)")
 _BENCHMARK_ROOT_PLACEHOLDERS = (
     "${MARS_BENCHMARK_ROOT}/",
     "$MARS_BENCHMARK_ROOT/",
+)
+_SWEBENCH_CACHE_ROOT_PLACEHOLDERS = (
+    "${MARS_SWEBENCH_CACHE_ROOT}",
+    "$MARS_SWEBENCH_CACHE_ROOT",
 )
 _REPO_ROOT_PLACEHOLDERS = (
     "${MARS_REPO_ROOT}/",
@@ -139,13 +160,17 @@ def _relocate_string_paths(text: str) -> str:
     rewritten = text
     for placeholder in _BENCHMARK_ROOT_PLACEHOLDERS:
         rewritten = rewritten.replace(placeholder, f"{BENCHMARK_ROOT}/")
+    for placeholder in _SWEBENCH_CACHE_ROOT_PLACEHOLDERS:
+        rewritten = rewritten.replace(placeholder, str(SWEBENCH_CACHE_ROOT))
     for placeholder in _REPO_ROOT_PLACEHOLDERS:
         rewritten = rewritten.replace(placeholder, f"{MARS_REPO_ROOT}/")
     home_root = Path.home()
     for placeholder in _HOME_PLACEHOLDERS:
         rewritten = rewritten.replace(placeholder, f"{home_root}/")
     rewritten = _MARS_BENCHMARK_PREFIX_RE.sub(f"{BENCHMARK_ROOT}/", rewritten)
+    rewritten = _SWEBENCH_CACHE_PREFIX_RE.sub(str(SWEBENCH_CACHE_ROOT), rewritten)
     git_task_bench_root = str(BENCHMARK_ROOT / "GitTaskBench")
+    rewritten = _ABSOLUTE_GIT_TASK_BENCH_RE.sub(git_task_bench_root, rewritten)
     return _GIT_TASK_BENCH_ALIAS_RE.sub(git_task_bench_root, rewritten)
 
 

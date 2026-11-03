@@ -425,6 +425,12 @@ class EngineArgs:
         ObservabilityConfig.collect_detailed_traces
     disable_async_output_proc: bool = not ModelConfig.use_async_output_proc
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+    lightllm_router_token_ratio: float = (
+        SchedulerConfig.lightllm_router_token_ratio)
+    lightllm_router_max_wait_tokens: int = (
+        SchedulerConfig.lightllm_router_max_wait_tokens)
+    lightllm_chunked_prefill_size: Optional[int] = (
+        SchedulerConfig.lightllm_chunked_prefill_size)
     autellix_tail_fcfs_after_finished: int = (
         SchedulerConfig.autellix_tail_fcfs_after_finished)
     scheduler_cls: Union[str, Type[object]] = SchedulerConfig.scheduler_cls
@@ -876,6 +882,15 @@ class EngineArgs:
         # are no longer supported.
         scheduler_group.add_argument("--scheduling-policy",
                                      **scheduler_kwargs["policy"])
+        scheduler_group.add_argument(
+            "--lightllm-router-token-ratio",
+            **scheduler_kwargs["lightllm_router_token_ratio"])
+        scheduler_group.add_argument(
+            "--lightllm-router-max-wait-tokens",
+            **scheduler_kwargs["lightllm_router_max_wait_tokens"])
+        scheduler_group.add_argument(
+            "--lightllm-chunked-prefill-size",
+            **scheduler_kwargs["lightllm_chunked_prefill_size"])
         scheduler_group.add_argument(
             "--autellix-tail-fcfs-after-finished",
             **scheduler_kwargs["autellix_tail_fcfs_after_finished"])
@@ -1367,6 +1382,11 @@ class EngineArgs:
             send_delta_data=(envs.VLLM_USE_RAY_SPMD_WORKER
                              and parallel_config.use_ray),
             policy=self.scheduling_policy,
+            lightllm_router_token_ratio=self.lightllm_router_token_ratio,
+            lightllm_router_max_wait_tokens=(
+                self.lightllm_router_max_wait_tokens),
+            lightllm_chunked_prefill_size=(
+                self.lightllm_chunked_prefill_size),
             autellix_tail_fcfs_after_finished=(
                 self.autellix_tail_fcfs_after_finished),
             scheduler_cls=self.scheduler_cls,

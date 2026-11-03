@@ -396,9 +396,11 @@ class EngineCore:
             num_free_blocks = int(
                 scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
             usage = float(scheduler.kv_cache_manager.usage)
+            prefix_stats = (
+                scheduler.kv_cache_manager.get_recent_prefix_cache_stats())
 
             usable_blocks = max(0, num_gpu_blocks - 1)
-            return {
+            stats = {
                 "block_size": block_size,
                 "num_gpu_blocks": num_gpu_blocks,
                 "num_free_blocks": num_free_blocks,
@@ -406,6 +408,8 @@ class EngineCore:
                 "total_tokens": usable_blocks * block_size,
                 "free_tokens": num_free_blocks * block_size,
             }
+            stats.update(prefix_stats)
+            return stats
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
 

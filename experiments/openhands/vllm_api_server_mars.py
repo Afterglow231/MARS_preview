@@ -11,6 +11,21 @@ from vllm.entrypoints.openai import api_server as api
 from vllm.entrypoints.utils import cli_env_setup
 from vllm.utils import FlexibleArgumentParser
 
+from qwen_responses_compat import (
+    CodexResponsesWireCompatibilityMiddleware,
+    install_qwen_responses_compat,
+)
+
+
+def _engine_utility_rpc(client):
+    """Return the utility RPC exposed by either V0 or V1 async engines."""
+
+    for candidate in (client, getattr(client, "engine_core", None)):
+        call = getattr(candidate, "call_utility_async", None)
+        if callable(call):
+            return call
+    return None
+
 
 def _ensure_kv_cache_stats_route(app) -> None:
     for route in app.routes:
@@ -19,7 +34,7 @@ def _ensure_kv_cache_stats_route(app) -> None:
 
     async def kv_cache_stats(raw_request: Request) -> JSONResponse:
         client = api.engine_client(raw_request)
-        call = getattr(client, "call_utility_async", None)
+        call = _engine_utility_rpc(client)
         if not callable(call):
             raise HTTPException(
                 status_code=HTTPStatus.NOT_IMPLEMENTED,
@@ -48,10 +63,15 @@ _orig_build_app = api.build_app
 def _build_app_with_kv_route(args):
     app = _orig_build_app(args)
     _ensure_kv_cache_stats_route(app)
+    # Codex replays valid assistant output items in a shape that the pinned
+    # vLLM/OpenAI Pydantic types reject before the Responses handler runs.
+    # Normalize only those serialization fields at the server boundary.
+    app.add_middleware(CodexResponsesWireCompatibilityMiddleware)
     return app
 
 
 api.build_app = _build_app_with_kv_route
+install_qwen_responses_compat()
 
 
 if __name__ == "__main__":

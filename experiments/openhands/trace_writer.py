@@ -243,6 +243,7 @@ class RequestTraceCollector:
         self._agent_errors: list[dict[str, Any]] = []
         self._conversation_errors: list[dict[str, Any]] = []
         self._worker_info: WorkerStartInfo | None = None
+        self._frontend_terminal_time_s: float | None = None
         self._workspace_file_count = 0
         self._last_scheduler_tool_name: str | None = None
         self._verification_tool_count = 0
@@ -280,6 +281,24 @@ class RequestTraceCollector:
                     "file_count": self._workspace_file_count,
                 }
             )
+
+    def mark_frontend_terminal(self) -> float:
+        """Freeze agent completion before Conversation/sandbox cleanup."""
+
+        with self._lock:
+            if self._frontend_terminal_time_s is None:
+                self._frontend_terminal_time_s = now_s()
+                self.events.write(
+                    {
+                        "ts": self._frontend_terminal_time_s,
+                        "event": "frontend_terminal",
+                        "request_id": self.request_id,
+                        "dataset_request_id": self.dataset_request_id,
+                        "benchmark": self.benchmark,
+                        "task_id": self.task_id,
+                    }
+                )
+            return self._frontend_terminal_time_s
 
     def on_token(self, _chunk: Any) -> None:
         return
@@ -603,25 +622,19 @@ class RequestTraceCollector:
         error: Exception | None = None,
     ) -> dict[str, Any]:
         with self._lock:
-            end_time_s = now_s()
+            end_time_s = self._frontend_terminal_time_s or now_s()
             worker_start = self._worker_info.start_time_s if self._worker_info else self.arrival_time_s
             queue_wait_s = self._worker_info.queue_wait_s if self._worker_info else 0.0
 
-            gpu_total_s = sum(
-                float(call["duration_s"] or 0.0)
-                for call in self._llm_calls
-                if call.get("duration_s") is not None
-            )
-            tool_total_s = sum(
-                float(call["duration_s"] or 0.0)
-                for call in self._tool_calls
-                if call.get("duration_s") is not None
-            )
-            tool_wait_total_s = sum(
-                float(call["wait_s"] or 0.0)
-                for call in self._tool_calls
-                if call.get("wait_s") is not None
-            )
+            def complete_sum(items: list[dict[str, Any]], field: str) -> float | None:
+                values = [item.get(field) for item in items]
+                if any(value is None for value in values):
+                    return None
+                return float(sum(float(value) for value in values))
+
+            gpu_total_s = complete_sum(self._llm_calls, "duration_s")
+            tool_total_s = complete_sum(self._tool_calls, "duration_s")
+            tool_wait_total_s = complete_sum(self._tool_calls, "wait_s")
 
             llm_rounds = []
             llm_index_by_call_id: dict[str, int] = {}
@@ -657,10 +670,14 @@ class RequestTraceCollector:
                 "end_time_s": end_time_s,
                 "queue_wait_s": float(queue_wait_s),
                 "e2e_latency_s": float(max(0.0, end_time_s - self.arrival_time_s)),
-                "gpu_total_s": float(gpu_total_s),
-                "tool_total_s": float(tool_total_s),
-                "tool_wait_total_s": float(tool_wait_total_s),
-                "wait_total_s": float(queue_wait_s + tool_wait_total_s),
+                "gpu_total_s": gpu_total_s,
+                "tool_total_s": tool_total_s,
+                "tool_wait_total_s": tool_wait_total_s,
+                "wait_total_s": (
+                    float(queue_wait_s + tool_wait_total_s)
+                    if tool_wait_total_s is not None
+                    else None
+                ),
                 "verification_tool_count": int(self._verification_tool_count),
                 "status": status,
                 "conversation_status": conversation_status,

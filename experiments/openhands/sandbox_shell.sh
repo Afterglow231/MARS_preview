@@ -9,6 +9,9 @@ host_conda_root="${MARS_HOST_CONDA_ROOT:-}"
 host_venvs_root="${MARS_HOST_VENVS_ROOT:-}"
 host_models_root="${MARS_HOST_MODELS_ROOT:-}"
 local_inputs_dir="${MARS_LOCAL_INPUTS_DIR:-}"
+request_readonly_paths="${MARS_REQUEST_READONLY_PATHS:-}"
+bwrap_bin="${MARS_BWRAP_BIN:-$(command -v bwrap || true)}"
+bwrap_bin="${bwrap_bin:-/usr/bin/bwrap}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 guard_source_py="${script_dir}/command_guard.py"
 guard_runtime_py="${runtime}/command_guard.py"
@@ -40,7 +43,6 @@ __mars_guard_preexec() {
   trap - DEBUG
   local cmd="\${BASH_COMMAND:-}"
   local reason=""
-  local rc=0
   local cmd_lc="\${cmd,,}"
 
   if [[ -n "\$cmd" ]]; then
@@ -50,7 +52,7 @@ __mars_guard_preexec() {
           reason="\$(MARS_GUARD_ACTIVE=1 /usr/bin/env python3 "\$MARS_GUARD_COMMAND_PY" check-terminal --workspace-dir "\$MARS_WORKSPACE_DIR" --command "\$cmd" 2>/dev/null || true)"
           if [[ -n "\$reason" ]]; then
             printf 'Command blocked by MARS runtime guard.\nReason: %s\nCommand: %s\n' "\$reason" "\$cmd" >&2
-            rc=1
+            exit 126
           fi
         fi
         ;;
@@ -58,10 +60,9 @@ __mars_guard_preexec() {
   fi
 
   trap '__mars_guard_preexec' DEBUG
-  return "\$rc"
+  return 0
 }
 
-shopt -s extdebug
 trap '__mars_guard_preexec' DEBUG
 EOF
 
@@ -103,13 +104,17 @@ fi
 if [[ -n "$host_models_root" ]]; then
   collect_parent_dirs "$host_models_root"
 fi
-if [[ -n "$local_inputs_dir" ]]; then
-  collect_parent_dirs "$local_inputs_dir"
-fi
+request_readonly_array=()
+while IFS= read -r readonly_path; do
+  [[ -n "$readonly_path" ]] || continue
+  request_readonly_array+=("$readonly_path")
+  collect_parent_dirs "$readonly_path"
+done <<<"$request_readonly_paths"
 
 bwrap_args=(
   --die-with-parent
   --dev-bind /dev /dev
+  --unshare-pid
   --proc /proc
   --tmpfs /tmp
   --dir /var
@@ -149,22 +154,24 @@ fi
 if [[ -n "$host_venvs_root" && -d "$host_venvs_root" ]]; then
   bwrap_args+=(--ro-bind "$host_venvs_root" "$host_venvs_root")
 fi
-if [[ -n "$local_inputs_dir" && -d "$local_inputs_dir" ]]; then
-  bwrap_args+=(--ro-bind "$local_inputs_dir" "$local_inputs_dir")
-fi
+for readonly_path in "${request_readonly_array[@]}"; do
+  if [[ -e "$readonly_path" ]]; then
+    bwrap_args+=(--ro-bind "$readonly_path" "$readonly_path")
+  fi
+done
 
 if [[ -n "$host_models_root" && -d "$host_models_root" && "${MARS_ALLOW_HOST_MODELS_READ:-0}" == "1" ]]; then
   bwrap_args+=(--ro-bind "$host_models_root" "$host_models_root")
 fi
 
-if /usr/bin/bwrap \
+if [[ -x "$bwrap_bin" ]] && "$bwrap_bin" \
   --ro-bind /usr /usr \
   --ro-bind /bin /bin \
   --ro-bind /lib /lib \
   --ro-bind /lib64 /lib64 \
   --proc /proc \
   /bin/true >/dev/null 2>&1; then
-  exec /usr/bin/bwrap "${bwrap_args[@]}" /usr/bin/env BASH_ENV="$guard_runtime_rc" /bin/bash --noprofile --rcfile "$guard_runtime_rc" "$@"
+  exec "$bwrap_bin" "${bwrap_args[@]}" /usr/bin/env BASH_ENV="$guard_runtime_rc" /bin/bash --noprofile --rcfile "$guard_runtime_rc" "$@"
 fi
 
 if [[ "${MARS_REQUIRE_BWRAP:-1}" == "1" ]]; then

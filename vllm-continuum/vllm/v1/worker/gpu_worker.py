@@ -4,6 +4,7 @@
 import copy
 import gc
 import os
+import time
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -33,12 +34,26 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm.forward_step_trace import enabled as forward_step_trace_enabled
+from vllm.forward_step_trace import nvtx_range, write_record
 
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
+
+
+def _forward_step_nvtx_label(record: dict[str, Any]) -> str:
+    return (
+        "vllm_forward_step "
+        f"step={record.get('step_id')} "
+        f"mode={record.get('batch_mode')} "
+        f"total_tok={record.get('total_scheduled_tokens')} "
+        f"prefill_tok={record.get('prefill_token_count')} "
+        f"decode_tok={record.get('decode_token_count')} "
+        f"reqs={record.get('scheduled_req_count')}"
+    )
 
 
 class Worker(WorkerBase):
@@ -433,8 +448,41 @@ class Worker(WorkerBase):
                 get_pp_group().recv_tensor_dict(
                     all_gather_group=get_tp_group()))
 
-        output = self.model_runner.execute_model(scheduler_output,
-                                                 intermediate_tensors)
+        profile_meta = getattr(scheduler_output, "profile_batch_meta", None)
+        should_trace = (
+            forward_pass and profile_meta is not None
+            and forward_step_trace_enabled()
+        )
+        if should_trace:
+            record = dict(profile_meta)
+            record.update({
+                "worker_rank": self.rank,
+                "worker_local_rank": self.local_rank,
+                "is_driver_worker": bool(self.is_driver_worker),
+                "t_forward_begin_s": time.time(),
+            })
+            begin_mono = time.monotonic()
+            error = None
+            try:
+                with nvtx_range(_forward_step_nvtx_label(record)):
+                    output = self.model_runner.execute_model(
+                        scheduler_output, intermediate_tensors)
+            except BaseException as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                end_mono = time.monotonic()
+                record.update({
+                    "t_forward_end_s": time.time(),
+                    "wall_time_s": float(end_mono - begin_mono),
+                    "status": "error" if error else "ok",
+                })
+                if error:
+                    record["error"] = error
+                write_record(record)
+        else:
+            output = self.model_runner.execute_model(scheduler_output,
+                                                     intermediate_tensors)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
             return output
 

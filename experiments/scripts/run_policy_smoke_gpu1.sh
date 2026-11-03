@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Smoke-test all bundled scheduling policies on one GPU.
 # Defaults: vLLM replay uses 200 requests; OpenHands uses 50 requests.
+# Optional codex/opencode targets use AGENT_CLI_REQUESTS (default 20).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MARS_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -11,11 +12,12 @@ source "${SCRIPT_DIR}/common_runtime.sh"
 
 BASELINE_SCRIPT="${SCRIPT_DIR}/run_baseline_continuum.sh"
 OPENHANDS_SCRIPT="${SCRIPT_DIR}/run_openhands_qwen3_local.sh"
+AGENT_CLI_SCRIPT="${SCRIPT_DIR}/run_agent_cli_local.sh"
 SOURCE_TASKS_PATH="${SOURCE_TASKS_PATH:-${MARS_DIR}/benchmark/hybrid_workloads/test_workload.jsonl}"
 MARS_PYTHON="${MARS_PYTHON:-$(mars_default_python "${HOST_HOME}/miniconda3/envs/mars/bin/python")}"
 
 GPU="${GPU:-1}"
-POLICIES="${POLICIES:-continuum continuum_dy autellix fcfs infercept mars}"
+POLICIES="${POLICIES:-continuum continuum_dy autellix fcfs infercept lightllm mars}"
 TARGETS="${TARGETS:-vllm openhands}"
 RPS="${RPS:-0.2}"
 MAX_WORKERS="${MAX_WORKERS:-0}"
@@ -25,6 +27,7 @@ DRY_RUN="${DRY_RUN:-0}"
 
 VLLM_REQUESTS="${VLLM_REQUESTS:-${REQUESTS:-200}}"
 OPENHANDS_REQUESTS="${OPENHANDS_REQUESTS:-${REQUESTS:-50}}"
+AGENT_CLI_REQUESTS="${AGENT_CLI_REQUESTS:-${REQUESTS:-20}}"
 
 CPU_TOOL="${CPU_TOOL:-16-23}"
 CPU_GPU="${CPU_GPU:-0-1}"
@@ -35,6 +38,7 @@ OUT_ROOT="${OUT_ROOT:-${MARS_DIR}/outputs/policy_smoke_gpu${GPU}}"
 RUN_ROOT="${OUT_ROOT}/${RUN_ID}"
 VLLM_TASKS_SLICE="${RUN_ROOT}/test_workload_first${VLLM_REQUESTS}_vllm.jsonl"
 OPENHANDS_TASKS_SLICE="${RUN_ROOT}/test_workload_first${OPENHANDS_REQUESTS}_openhands.jsonl"
+AGENT_CLI_TASKS_SLICE="${RUN_ROOT}/test_workload_first${AGENT_CLI_REQUESTS}_agent_cli.jsonl"
 SUMMARY_PATH="${RUN_ROOT}/summary.tsv"
 
 die() {
@@ -67,6 +71,7 @@ request_count_for_target() {
   case "$1" in
     vllm) echo "${VLLM_REQUESTS}" ;;
     openhands) echo "${OPENHANDS_REQUESTS}" ;;
+    codex|opencode) echo "${AGENT_CLI_REQUESTS}" ;;
     *) die "Unknown target: $1" ;;
   esac
 }
@@ -75,6 +80,7 @@ slice_path_for_target() {
   case "$1" in
     vllm) echo "${VLLM_TASKS_SLICE}" ;;
     openhands) echo "${OPENHANDS_TASKS_SLICE}" ;;
+    codex|opencode) echo "${AGENT_CLI_TASKS_SLICE}" ;;
     *) die "Unknown target: $1" ;;
   esac
 }
@@ -124,13 +130,15 @@ preflight() {
   [[ -x "${MARS_PYTHON}" ]] || die "MARS_PYTHON not found or not executable: ${MARS_PYTHON}"
   require_positive_int "VLLM_REQUESTS" "${VLLM_REQUESTS}"
   require_positive_int "OPENHANDS_REQUESTS" "${OPENHANDS_REQUESTS}"
+  require_positive_int "AGENT_CLI_REQUESTS" "${AGENT_CLI_REQUESTS}"
 
   local target
   for target in "${TARGET_LIST[@]}"; do
     case "${target}" in
       vllm) [[ -f "${BASELINE_SCRIPT}" ]] || die "Baseline script not found: ${BASELINE_SCRIPT}" ;;
       openhands) [[ -f "${OPENHANDS_SCRIPT}" ]] || die "OpenHands script not found: ${OPENHANDS_SCRIPT}" ;;
-      *) die "Unknown target: ${target} (expected: vllm, openhands)" ;;
+      codex|opencode) [[ -f "${AGENT_CLI_SCRIPT}" ]] || die "Agent CLI script not found: ${AGENT_CLI_SCRIPT}" ;;
+      *) die "Unknown target: ${target} (expected: vllm, openhands, codex, opencode)" ;;
     esac
   done
 
@@ -204,12 +212,41 @@ run_openhands_policy() {
   return "${PIPESTATUS[0]}"
 }
 
+run_agent_cli_policy() {
+  local agent="$1"
+  local policy="$2"
+  local run_dir="${RUN_ROOT}/${agent}/${policy}"
+  mkdir -p "${run_dir}"
+
+  (
+    env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      MARS_PYTHON="${MARS_PYTHON}" \
+      TP=1 \
+      AGENTS="${agent}" \
+      TASKS_PATH="${AGENT_CLI_TASKS_SLICE}" \
+      MAX_REQUESTS="${AGENT_CLI_REQUESTS}" \
+      SHUFFLE=0 \
+      RPS="${RPS}" \
+      MAX_WORKERS="${MAX_WORKERS}" \
+      SCHEDULING_POLICY="${policy}" \
+      AUTELLIX_FCFS_AFTER_FINISHED=0 \
+      CPU_SERVER="${CPU_GPU}" \
+      CPU_AGENT="${CPU_TOOL}" \
+      RUN_DIR="${run_dir}" \
+      RUN_LABEL="policy_smoke_${policy}" \
+      bash "${AGENT_CLI_SCRIPT}"
+  ) 2>&1 | tee "${run_dir}/driver.log"
+  return "${PIPESTATUS[0]}"
+}
+
 run_target_policy() {
   local target="$1"
   local policy="$2"
   case "${target}" in
     vllm) run_vllm_policy "${policy}" ;;
     openhands) run_openhands_policy "${policy}" ;;
+    codex|opencode) run_agent_cli_policy "${target}" "${policy}" ;;
     *) die "Unknown target: ${target}" ;;
   esac
 }
@@ -255,6 +292,7 @@ print_config() {
   echo "GPU=${GPU}"
   target_enabled vllm && echo "VLLM_REQUESTS=${VLLM_REQUESTS}" && echo "VLLM_TASKS_SLICE=${VLLM_TASKS_SLICE}"
   target_enabled openhands && echo "OPENHANDS_REQUESTS=${OPENHANDS_REQUESTS}" && echo "OPENHANDS_TASKS_SLICE=${OPENHANDS_TASKS_SLICE}"
+  { target_enabled codex || target_enabled opencode; } && echo "AGENT_CLI_REQUESTS=${AGENT_CLI_REQUESTS}" && echo "AGENT_CLI_TASKS_SLICE=${AGENT_CLI_TASKS_SLICE}"
   echo "RPS=${RPS}"
   echo "CPU_CORES=${CPU_CORES}"
   echo "CPU_GPU=${CPU_GPU}"

@@ -10,7 +10,7 @@ from typing import Any
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 
-from common import now_s
+from common import BENCHMARK_ROOT, OPENHANDS_FORCE_STRING_SERIALIZER, now_s
 from llm_trace_bridge import install_llm_trace_patch, register_llm_collector, unregister_llm_collector
 from request_bootstrap import (
     build_user_request,
@@ -18,6 +18,7 @@ from request_bootstrap import (
     materialize_workspace_init,
     requires_tool_verification,
 )
+from sandbox_paths import task_readonly_paths
 from tool_trace_bridge import wrap_agent_tools
 from trace_writer import RequestTraceCollector
 
@@ -26,6 +27,10 @@ MAX_VERIFICATION_NUDGES = 1
 RUNTIME_DIR_NAME = ".mars_runtime"
 SANDBOX_SHELL_PATH = Path(__file__).with_name("sandbox_shell.sh")
 HOST_HOME = Path(os.environ.get("MARS_HOST_HOME") or Path.home()).expanduser().resolve()
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 def _load_openhands_sdk() -> dict[str, Any]:
@@ -89,16 +94,45 @@ def _build_tools(config: OpenHandsConfig, sdk: dict[str, Any]) -> list[Any]:
     terminal_params: dict[str, Any] = {}
     if config.terminal_no_change_timeout_s is not None:
         terminal_params["no_change_timeout_seconds"] = int(config.terminal_no_change_timeout_s)
-    # Force subprocess mode so we can route all terminal commands through the
-    # workspace-scoped sandbox shell instead of a host-level tmux session.
-    terminal_params["terminal_type"] = "subprocess"
-    terminal_params["shell_path"] = str(SANDBOX_SHELL_PATH)
+    if not _env_flag("MARS_OPENHANDS_DEFAULT_TERMINAL"):
+        # Force subprocess mode so we can route all terminal commands through the
+        # workspace-scoped sandbox shell instead of a host-level tmux session.
+        terminal_type = config.terminal_type or "subprocess"
+        terminal_params["terminal_type"] = terminal_type
+        if terminal_type == "subprocess":
+            terminal_params["shell_path"] = str(SANDBOX_SHELL_PATH)
 
     return [
         Tool(name=TerminalTool.name, params=terminal_params),
         Tool(name=FileEditorTool.name),
         Tool(name=TaskTrackerTool.name),
     ]
+
+
+def _build_llm(config: OpenHandsConfig, sdk: dict[str, Any]) -> Any:
+    """Build the common text-only OpenHands client for every backend.
+
+    OpenHands otherwise serializes text as OpenAI content-part lists whenever
+    native tool calling is active. Some conforming text-only providers accept
+    only string content. The SDK's string serializer preserves tool-call and
+    tool-result threading while joining text parts in their original order.
+    Keeping this setting common to every backend avoids a backend-side adapter.
+    """
+
+    LLM = sdk["LLM"]
+    SecretStr = sdk["SecretStr"]
+    return LLM(
+        model=_normalize_openai_compatible_model(config.model),
+        api_key=SecretStr(config.api_key),
+        base_url=config.base_url,
+        stream=True,
+        timeout=config.llm_timeout_s,
+        num_retries=config.llm_num_retries,
+        temperature=config.temperature,
+        top_p=config.top_p,
+        max_output_tokens=config.max_output_tokens,
+        force_string_serializer=OPENHANDS_FORCE_STRING_SERIALIZER,
+    )
 
 
 def _prepare_workspace_runtime_dirs(workspace_dir: Path) -> dict[str, Path]:
@@ -218,11 +252,22 @@ def run_task_request(
     workspace_dir = (workspace_root / request_id).resolve()
     workspace_dir.mkdir(parents=True, exist_ok=True)
     runtime_env = _apply_workspace_runtime_env(workspace_dir)
+    local_inputs_root = Path(
+        os.environ.get("MARS_LOCAL_INPUTS_DIR", str(workspace_dir))
+    ).expanduser().resolve(strict=False)
+    request_readonly_paths = task_readonly_paths(
+        task,
+        allowed_roots=(local_inputs_root, BENCHMARK_ROOT),
+    )
+    runtime_env["MARS_REQUEST_READONLY_PATHS"] = "\n".join(
+        str(path) for path in request_readonly_paths
+    )
+    os.environ["MARS_REQUEST_READONLY_PATHS"] = runtime_env[
+        "MARS_REQUEST_READONLY_PATHS"
+    ]
     sdk = _load_openhands_sdk()
     Agent = sdk["Agent"]
     Conversation = sdk["Conversation"]
-    LLM = sdk["LLM"]
-    SecretStr = sdk["SecretStr"]
     register_default_tools = sdk["register_default_tools"]
 
     install_llm_trace_patch()
@@ -245,17 +290,7 @@ def run_task_request(
     file_count = materialize_workspace_init(task, workspace_dir)
     collector.set_workspace_materialized(file_count)
 
-    llm = LLM(
-        model=_normalize_openai_compatible_model(config.model),
-        api_key=SecretStr(config.api_key),
-        base_url=config.base_url,
-        stream=True,
-        timeout=config.llm_timeout_s,
-        num_retries=config.llm_num_retries,
-        temperature=config.temperature,
-        top_p=config.top_p,
-        max_output_tokens=config.max_output_tokens,
-    )
+    llm = _build_llm(config, sdk)
     register_llm_collector(llm, collector)
 
     conversation = None
@@ -275,6 +310,9 @@ def run_task_request(
             "workspace_dir": str(workspace_dir),
             "runtime_dir": runtime_env.get("MARS_RUNTIME_DIR"),
             "artifact_dir": runtime_env.get("MARS_ARTIFACT_DIR"),
+            "openhands_default_terminal": _env_flag("MARS_OPENHANDS_DEFAULT_TERMINAL"),
+            "force_string_serializer": OPENHANDS_FORCE_STRING_SERIALIZER,
+            "terminal_type": config.terminal_type,
         }
     )
 
@@ -340,6 +378,10 @@ def run_task_request(
             else None
         )
     finally:
+        # The agent's native state is terminal now. Freeze the comparable
+        # request boundary before Conversation.close() tears down sandboxes and
+        # other runtime resources.
+        collector.mark_frontend_terminal()
         unregister_llm_collector(llm)
         if conversation is not None:
             try:

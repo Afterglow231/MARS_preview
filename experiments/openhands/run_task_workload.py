@@ -21,12 +21,13 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from common import (
     JSONLWriter,
     KVEventsCollector,
+    OPENHANDS_FORCE_STRING_SERIALIZER,
     atomic_write_json,
     load_tasks_jsonl,
     mean,
@@ -36,6 +37,10 @@ from common import (
     set_self_affinity,
 )
 from request_bootstrap import build_user_request
+from security_policy import (
+    blocked_security_task_decision,
+    build_policy_rejected_result,
+)
 
 LOCAL_RUNTIME_BUNDLE_FILES = (
     "command_guard.py",
@@ -44,7 +49,9 @@ LOCAL_RUNTIME_BUNDLE_FILES = (
     "openhands_runner.py",
     "request_bootstrap.py",
     "request_worker.py",
+    "sandbox_paths.py",
     "sandbox_shell.sh",
+    "security_policy.py",
     "tool_trace_bridge.py",
     "trace_writer.py",
 )
@@ -53,6 +60,11 @@ LOCAL_INPUT_PATH_KEYS = {
     "repo_cache_path",
     "src_path",
 }
+# TerminalBench task trees can contain large Docker build contexts. Resolve
+# their portable placeholder but keep the source tree in place; the agent CLI
+# binds only the exact per-request task directory read-only and reaches Docker
+# through its scoped proxy.
+READ_ONLY_INPUT_PATH_KEYS = {"task_dir"}
 
 
 def _safe_print(*args: Any, **kwargs: Any) -> None:
@@ -79,6 +91,14 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--tasks", type=str, required=True, help="Path to mas_task_v1 JSONL workload.")
     ap.add_argument("--out-dir", type=str, required=True, help="Output directory for run artifacts.")
     ap.add_argument(
+        "--allow-blocked-security-tasks",
+        action="store_true",
+        help=(
+            "Allow security-sensitive TerminalBench tasks rejected by the shared-system "
+            "profile. Use only in an approved isolated environment."
+        ),
+    )
+    ap.add_argument(
         "--workspace-root",
         type=str,
         default=None,
@@ -93,6 +113,12 @@ def _parse_args() -> argparse.Namespace:
         "--no-localize-task-inputs",
         action="store_true",
         help="Do not copy local task input paths into <out-dir>/_localized_inputs.",
+    )
+    ap.add_argument(
+        "--local-inputs-dir",
+        type=str,
+        default=None,
+        help="Shared localized-input root. Defaults to <out-dir>/_localized_inputs.",
     )
     ap.add_argument("--model", type=str, required=True, help="Model name served by the vLLM endpoint.")
     ap.add_argument("--base-url", type=str, required=True, help="OpenAI-compatible vLLM base URL.")
@@ -118,7 +144,12 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--max-output-tokens", type=int, default=2048, help="Maximum output tokens per LLM call.")
     ap.add_argument("--llm-timeout-s", type=int, default=3000, help="LLM HTTP timeout in seconds.")
     ap.add_argument("--llm-num-retries", type=int, default=3, help="OpenHands/LiteLLM retry count per LLM call.")
-    ap.add_argument("--max-iterations", type=int, default=40, help="Maximum OpenHands iterations per request.")
+    ap.add_argument(
+        "--codex-enable-subagents",
+        action="store_true",
+        help="Enable Codex collaboration instructions and built-in subagents.",
+    )
+    ap.add_argument("--max-iterations", type=int, default=100, help="Maximum OpenHands iterations per request.")
     ap.add_argument(
         "--terminal-no-change-timeout-s",
         type=int,
@@ -146,6 +177,19 @@ def _parse_args() -> argparse.Namespace:
         help="Hard per-request worker timeout in seconds. Use 0 to disable.",
     )
     ap.add_argument("--scheduling-policy", type=str, default="fcfs", help="vLLM scheduling policy metadata.")
+    ap.add_argument("--concur-window-init", type=int, default=1, help="Concur initial active-agent window.")
+    ap.add_argument(
+        "--concur-max-active-agents",
+        type=int,
+        default=0,
+        help="Concur maximum active-agent window; 0 uses the effective worker count.",
+    )
+    ap.add_argument("--concur-control-interval-s", type=float, default=0.2, help="Concur KV control period.")
+    ap.add_argument("--concur-additive-increase", type=int, default=2, help="Concur AIMD additive increase.")
+    ap.add_argument("--concur-multiplicative-decrease", type=float, default=0.5, help="Concur AIMD multiplicative decrease.")
+    ap.add_argument("--concur-util-low", type=float, default=0.2, help="Concur low KV-utilization threshold.")
+    ap.add_argument("--concur-util-high", type=float, default=0.5, help="Concur high KV-utilization threshold.")
+    ap.add_argument("--concur-hit-rate-threshold", type=float, default=0.2, help="Concur low prefix-hit-rate threshold.")
     ap.add_argument("--kv-events", action="store_true", help="Collect vLLM KV events via ZMQ and dump kv_events.jsonl.")
     ap.add_argument(
         "--kv-events-endpoint",
@@ -243,7 +287,7 @@ def _looks_like_url(text: str) -> bool:
     )
 
 
-def _expand_existing_local_path(value: str) -> Path | None:
+def _expand_local_path(value: str) -> Path | None:
     text = str(value).strip()
     if not text or _looks_like_url(text):
         return None
@@ -255,7 +299,12 @@ def _expand_existing_local_path(value: str) -> Path | None:
         resolved = path.resolve(strict=False)
     except Exception:
         resolved = path
-    if not resolved.exists():
+    return resolved
+
+
+def _expand_existing_local_path(value: str) -> Path | None:
+    resolved = _expand_local_path(value)
+    if resolved is None or not resolved.exists():
         return None
     return resolved
 
@@ -352,6 +401,16 @@ def _rewrite_local_input_paths(
 
     rewritten: dict[str, Any] = {}
     for key, value in obj.items():
+        if key in READ_ONLY_INPUT_PATH_KEYS and isinstance(value, str):
+            src = _expand_local_path(value)
+            if src is not None:
+                rewritten_value = str(src)
+                if rewritten_value != value:
+                    stats["rewritten_readonly_paths"] = int(
+                        stats.get("rewritten_readonly_paths", 0)
+                    ) + 1
+                rewritten[key] = rewritten_value
+                continue
         if key in LOCAL_INPUT_PATH_KEYS and isinstance(value, str):
             src = _expand_existing_local_path(value)
             if src is not None:
@@ -359,6 +418,15 @@ def _rewrite_local_input_paths(
                 if localized != value:
                     stats["rewritten_paths"] = int(stats.get("rewritten_paths", 0)) + 1
                 rewritten[key] = localized
+                continue
+            missing_src = _expand_local_path(value)
+            if missing_src is not None:
+                rewritten_value = str(missing_src)
+                if rewritten_value != value:
+                    stats["rewritten_missing_paths"] = int(
+                        stats.get("rewritten_missing_paths", 0)
+                    ) + 1
+                rewritten[key] = rewritten_value
                 continue
         rewritten[key] = _rewrite_local_input_paths(
             value,
@@ -630,6 +698,39 @@ def _fetch_metrics_gpu_cache_usage(base_url: str, *, timeout_s: float = 3.0) -> 
     return None
 
 
+def _next_concur_window(
+    window: int,
+    *,
+    usage: float,
+    prefix_cache_hit_rate: float | None,
+    window_max: int,
+    additive_increase: int,
+    multiplicative_decrease: float,
+    util_low: float,
+    util_high: float,
+    hit_rate_threshold: float,
+) -> tuple[int, str]:
+    """Apply the repository's Concur AIMD control law."""
+    current = max(1, min(int(window), int(window_max)))
+    if float(usage) < float(util_low):
+        return (
+            min(int(window_max), current + int(additive_increase)),
+            "low_utilization",
+        )
+    if (
+        float(usage) > float(util_high)
+        and prefix_cache_hit_rate is not None
+        and float(prefix_cache_hit_rate) < float(hit_rate_threshold)
+    ):
+        return (
+            max(1, int(math.floor(current * float(multiplicative_decrease)))),
+            "high_utilization_low_hit_rate",
+        )
+    if float(usage) > float(util_high) and prefix_cache_hit_rate is None:
+        return current, "hit_rate_unavailable"
+    return current, "hold"
+
+
 def _kv_blocks_for_tokens(num_tokens: int, block_size: int) -> int:
     if block_size <= 0:
         return 0
@@ -657,50 +758,30 @@ def _summary(traces: list[dict[str, Any]], *, run: dict[str, Any]) -> dict[str, 
     if start_ts and end_ts and max(end_ts) > min(start_ts):
         throughput = float(len(end_ts) / (max(end_ts) - min(start_ts)))
 
+    def distribution(values: list[float]) -> dict[str, Any]:
+        total = len(traces)
+        sample_count = len(values)
+        return {
+            "mean": mean(values),
+            "p50": percentile(values, 50),
+            "p95": percentile(values, 95),
+            "sample_count": sample_count,
+            "unknown_count": max(0, total - sample_count),
+            "coverage": (float(sample_count) / float(total) if total else None),
+        }
+
     return {
         "run": run,
         "count": len(traces),
         "status": statuses,
-        "latency_s": {
-            "mean": mean(latencies),
-            "p50": percentile(latencies, 50),
-            "p95": percentile(latencies, 95),
-        },
-        "gpu_total_s": {
-            "mean": mean(gpu_totals),
-            "p50": percentile(gpu_totals, 50),
-            "p95": percentile(gpu_totals, 95),
-        },
-        "tool_total_s": {
-            "mean": mean(tool_totals),
-            "p50": percentile(tool_totals, 50),
-            "p95": percentile(tool_totals, 95),
-        },
-        "tool_wait_total_s": {
-            "mean": mean(tool_waits),
-            "p50": percentile(tool_waits, 50),
-            "p95": percentile(tool_waits, 95),
-        },
-        "queue_wait_s": {
-            "mean": mean(queue_waits),
-            "p50": percentile(queue_waits, 50),
-            "p95": percentile(queue_waits, 95),
-        },
-        "wait_total_s": {
-            "mean": mean(waits),
-            "p50": percentile(waits, 50),
-            "p95": percentile(waits, 95),
-        },
-        "llm_call_count": {
-            "mean": mean([float(x) for x in llm_call_counts]),
-            "p50": percentile([float(x) for x in llm_call_counts], 50),
-            "p95": percentile([float(x) for x in llm_call_counts], 95),
-        },
-        "tool_call_count": {
-            "mean": mean([float(x) for x in tool_call_counts]),
-            "p50": percentile([float(x) for x in tool_call_counts], 50),
-            "p95": percentile([float(x) for x in tool_call_counts], 95),
-        },
+        "latency_s": distribution(latencies),
+        "gpu_total_s": distribution(gpu_totals),
+        "tool_total_s": distribution(tool_totals),
+        "tool_wait_total_s": distribution(tool_waits),
+        "queue_wait_s": distribution(queue_waits),
+        "wait_total_s": distribution(waits),
+        "llm_call_count": distribution([float(x) for x in llm_call_counts]),
+        "tool_call_count": distribution([float(x) for x in tool_call_counts]),
         "throughput_rps": throughput,
     }
 
@@ -786,6 +867,24 @@ def _run_request_subprocess(
 ) -> dict[str, Any]:
     # Run one OpenHands request in an isolated worker process.
     # The main workload runner keeps scheduling/MARS state, while the worker owns the child processes it spawned as one process group.
+    policy_decision = blocked_security_task_decision(
+        task,
+        allow_blocked_security_tasks=bool(
+            getattr(args, "allow_blocked_security_tasks", False)
+        ),
+    )
+    if policy_decision is not None:
+        return build_policy_rejected_result(
+            task=task,
+            decision=policy_decision,
+            request_id=request_id,
+            arrival_time_s=arrival_time_s,
+            workspace_root=workspace_root,
+            request_run_dir=request_run_dir,
+            agent="openhands",
+            model=args.model,
+        )
+
     task_json = request_run_dir / "task.json"
     result_json = request_run_dir / "result.json"
     stdout_path = request_run_dir / "stdout.txt"
@@ -894,12 +993,12 @@ def _run_request_subprocess(
                 "arrival_time_s": arrival_time_s,
                 "start_time_s": arrival_time_s,
                 "end_time_s": end_time_s,
-                "queue_wait_s": 0.0,
+                "queue_wait_s": None,
                 "e2e_latency_s": float(max(0.0, end_time_s - arrival_time_s)),
-                "gpu_total_s": 0.0,
-                "tool_total_s": 0.0,
-                "tool_wait_total_s": 0.0,
-                "wait_total_s": 0.0,
+                "gpu_total_s": None,
+                "tool_total_s": None,
+                "tool_wait_total_s": None,
+                "wait_total_s": None,
                 "status": status,
                 "conversation_status": None,
                 "error": error_payload,
@@ -1032,6 +1131,7 @@ def _collect_completed_requests(
     future_meta: dict[concurrent.futures.Future[dict[str, Any]], dict[str, Any]] | None = None,
     live_tool_stats: LiveToolStats | None = None,
     pending_kv_blocks_by_request_id: dict[str, int] | None = None,
+    on_completed: Callable[[str], None] | None = None,
 ) -> set[concurrent.futures.Future[dict[str, Any]]]:
     # Non-blockingly collect completed request futures, persist their trace and event records.
     if not futures:
@@ -1058,6 +1158,8 @@ def _collect_completed_requests(
             live_tool_stats.unregister(request_id)
         if pending_kv_blocks_by_request_id is not None and request_id:
             pending_kv_blocks_by_request_id.pop(request_id, None)
+        if on_completed is not None and request_id:
+            on_completed(request_id)
         traces.append(trace)
         traces_writer.write(trace)
         for event in sorted(result.get("events") or [], key=lambda item: float(item.get("ts", 0.0))):
@@ -1072,6 +1174,16 @@ def _collect_completed_requests(
 
 def main() -> None:
     args = _parse_args()
+    if int(args.concur_window_init) < 1:
+        raise SystemExit("--concur-window-init must be >= 1")
+    if int(args.concur_max_active_agents) < 0:
+        raise SystemExit("--concur-max-active-agents must be >= 0")
+    if float(args.concur_control_interval_s) <= 0:
+        raise SystemExit("--concur-control-interval-s must be > 0")
+    if int(args.concur_additive_increase) < 1:
+        raise SystemExit("--concur-additive-increase must be >= 1")
+    if not 0.0 < float(args.concur_multiplicative_decrease) <= 1.0:
+        raise SystemExit("--concur-multiplicative-decrease must be in (0, 1]")
     if args.cpu_affinity:
         set_self_affinity(parse_cpu_list(args.cpu_affinity))
 
@@ -1086,7 +1198,11 @@ def main() -> None:
         _require_path_under(workspace_root, out_dir, label="workspace_root")
     out_dir.mkdir(parents=True, exist_ok=True)
     workspace_root.mkdir(parents=True, exist_ok=True)
-    local_inputs_dir = (out_dir / "_localized_inputs").resolve()
+    local_inputs_dir = (
+        Path(args.local_inputs_dir).expanduser().resolve()
+        if args.local_inputs_dir
+        else (out_dir / "_localized_inputs").resolve()
+    )
     local_inputs_dir.mkdir(parents=True, exist_ok=True)
     setattr(args, "local_inputs_dir", str(local_inputs_dir))
     os.environ["MARS_LOCAL_INPUTS_DIR"] = str(local_inputs_dir)
@@ -1139,6 +1255,10 @@ def main() -> None:
                 "effective_max_workers": effective_max_workers,
                 "runtime_bundle_dir": str(runtime_bundle_dir),
                 "max_requests": args.max_requests,
+                "security_admission_policy": {
+                    "default": "reject",
+                    "override_enabled": bool(args.allow_blocked_security_tasks),
+                },
                 "shuffle": bool(args.shuffle),
                 "seed": args.seed,
                 "temperature": args.temperature,
@@ -1146,12 +1266,37 @@ def main() -> None:
                 "max_output_tokens": args.max_output_tokens,
                 "llm_timeout_s": args.llm_timeout_s,
                 "llm_num_retries": args.llm_num_retries,
+                "codex_enable_subagents": bool(args.codex_enable_subagents),
+                "codex_namespace_tool_compat": (
+                    "flatten_restore_v1"
+                    if args.codex_enable_subagents
+                    else None
+                ),
                 "max_iterations": args.max_iterations,
                 "terminal_no_change_timeout_s": args.terminal_no_change_timeout_s,
                 "terminal_type": args.terminal_type,
                 "cpu_affinity": args.cpu_affinity,
                 "gpu_timeout_s": args.gpu_timeout_s,
                 "scheduling_policy": args.scheduling_policy,
+                "admission_controller": (
+                    "concur"
+                    if str(args.scheduling_policy).lower()
+                    in {"continuum_dy_con", "continuum_con", "fcfs_con"}
+                    else (
+                        "mars"
+                        if str(args.scheduling_policy).lower() == "mars"
+                        else None
+                    )
+                ),
+                "concur_window_init": args.concur_window_init,
+                "concur_max_active_agents": args.concur_max_active_agents,
+                "concur_control_interval_s": args.concur_control_interval_s,
+                "concur_additive_increase": args.concur_additive_increase,
+                "concur_multiplicative_decrease": args.concur_multiplicative_decrease,
+                "concur_util_low": args.concur_util_low,
+                "concur_util_high": args.concur_util_high,
+                "concur_hit_rate_threshold": args.concur_hit_rate_threshold,
+                "concur_shrink_semantics": "pause_at_next_llm_generation",
                 "kv_events": bool(args.kv_events),
                 "kv_events_endpoint": args.kv_events_endpoint,
                 "thread_pool": args.thread_pool,
@@ -1178,6 +1323,7 @@ def main() -> None:
                 "mars_no_kv_active_limit": args.mars_no_kv_active_limit,
                 "prefill_tokenizer": args.prefill_tokenizer,
                 "openhands_python": str(Path(args.openhands_python).expanduser()),
+                "force_string_serializer": OPENHANDS_FORCE_STRING_SERIALIZER,
                 "allow_workspace_outside_out_dir": bool(args.allow_workspace_outside_out_dir),
                 "localize_task_inputs": not bool(args.no_localize_task_inputs),
                 "browser_enabled": False,
@@ -1221,6 +1367,7 @@ def main() -> None:
         },
         "scheduling_policy": args.scheduling_policy,
         "runtime_bundle_dir": str(runtime_bundle_dir),
+        "force_string_serializer": OPENHANDS_FORCE_STRING_SERIALIZER,
         "kv_events": bool(args.kv_events),
         "kv_events_endpoint": args.kv_events_endpoint,
     }
@@ -1245,6 +1392,11 @@ def main() -> None:
 
     scheduling_policy = str(args.scheduling_policy or "fcfs").lower()
     use_mars = scheduling_policy == "mars" and int(args.mars_active_pool_size) > 0
+    use_concur = scheduling_policy in {
+        "continuum_dy_con",
+        "continuum_con",
+        "fcfs_con",
+    }
     prefill_estimator = PrefillTokenEstimator(args.prefill_tokenizer)
     if args.cpu_tool:
         tool_cores = parse_cpu_list(args.cpu_tool)
@@ -1370,6 +1522,27 @@ def main() -> None:
         mars_kv_last_full_mono = 0.0
         mars_kv_reliable_prev: bool | None = None
         mars_kv_source_prev: str | None = None
+        concur_window_max = max(
+            1,
+            min(
+                int(effective_max_workers),
+                int(args.concur_max_active_agents)
+                if int(args.concur_max_active_agents) > 0
+                else int(effective_max_workers),
+            ),
+        )
+        concur_active_limit = max(
+            1,
+            min(int(args.concur_window_init), int(concur_window_max)),
+        )
+        concur_last_control_mono = 0.0
+        concur_active_agents: set[str] = set()
+        concur_paused_agents: set[str] = set()
+        concur_active_order: list[str] = []
+        concur_paused_order: list[str] = []
+        concur_gate_root = (out_dir / "_concur_gates").resolve()
+        if use_concur:
+            concur_gate_root.mkdir(parents=True, exist_ok=True)
 
         def _poll_runtime_state() -> None:
             nonlocal futures
@@ -1384,6 +1557,7 @@ def main() -> None:
                 future_meta=future_meta,
                 live_tool_stats=live_tool_stats,
                 pending_kv_blocks_by_request_id=pending_kv_blocks_by_request_id,
+                on_completed=(_concur_complete if use_concur else None),
             )
             if len(traces) > prev_done_count:
                 last_done_wall_s = now_s()
@@ -1439,6 +1613,198 @@ def main() -> None:
                 }
                 payload.update(admission_meta)
                 events_writer.write(payload)
+
+        def _concur_gate_path(request_id: str) -> Path:
+            return concur_gate_root / f"{request_id}.active"
+
+        def _set_concur_gate(request_id: str, active: bool) -> None:
+            path = _concur_gate_path(request_id)
+            if active:
+                path.touch(exist_ok=True)
+            else:
+                path.unlink(missing_ok=True)
+
+        def _remove_concur_order(order: list[str], request_id: str) -> None:
+            try:
+                order.remove(request_id)
+            except ValueError:
+                pass
+
+        def _concur_complete(request_id: str) -> None:
+            was_active = request_id in concur_active_agents
+            was_paused = request_id in concur_paused_agents
+            concur_active_agents.discard(request_id)
+            concur_paused_agents.discard(request_id)
+            _remove_concur_order(concur_active_order, request_id)
+            _remove_concur_order(concur_paused_order, request_id)
+            _set_concur_gate(request_id, False)
+            events_writer.write(
+                {
+                    "ts": now_s(),
+                    "event": "concur_complete",
+                    "policy": scheduling_policy,
+                    "request_id": request_id,
+                    "was_active": bool(was_active),
+                    "was_paused": bool(was_paused),
+                    "window": int(concur_active_limit),
+                    "active_agents": len(concur_active_agents),
+                    "paused_agents": len(concur_paused_agents),
+                    "backlog": len(backlog),
+                }
+            )
+
+        def _concur_reconcile(reason: str) -> None:
+            # Match the repository's agent-centric Concur semantics: shrink
+            # by pausing the newest agents at their next LLM generation
+            # boundary; resume paused agents before admitting new FIFO work.
+            while (
+                len(concur_active_agents) > int(concur_active_limit)
+                and concur_active_order
+            ):
+                request_id = concur_active_order.pop()
+                if request_id not in concur_active_agents:
+                    continue
+                concur_active_agents.remove(request_id)
+                concur_paused_agents.add(request_id)
+                concur_paused_order.append(request_id)
+                _set_concur_gate(request_id, False)
+                events_writer.write(
+                    {
+                        "ts": now_s(),
+                        "event": "concur_pause",
+                        "policy": scheduling_policy,
+                        "request_id": request_id,
+                        "reason": reason,
+                        "window": int(concur_active_limit),
+                        "active_agents": len(concur_active_agents),
+                        "paused_agents": len(concur_paused_agents),
+                        "backlog": len(backlog),
+                    }
+                )
+
+            while len(concur_active_agents) < int(concur_active_limit):
+                request_id: str | None = None
+                while concur_paused_order and request_id is None:
+                    candidate = concur_paused_order.pop(0)
+                    if candidate in concur_paused_agents:
+                        request_id = candidate
+                if request_id is not None:
+                    concur_paused_agents.remove(request_id)
+                    concur_active_agents.add(request_id)
+                    concur_active_order.append(request_id)
+                    _set_concur_gate(request_id, True)
+                    events_writer.write(
+                        {
+                            "ts": now_s(),
+                            "event": "concur_resume",
+                            "policy": scheduling_policy,
+                            "request_id": request_id,
+                            "reason": reason,
+                            "window": int(concur_active_limit),
+                            "active_agents": len(concur_active_agents),
+                            "paused_agents": len(concur_paused_agents),
+                            "backlog": len(backlog),
+                        }
+                    )
+                    continue
+
+                if not backlog:
+                    break
+                entry = backlog.pop(0)
+                request_id = entry.request_id
+                concur_active_agents.add(request_id)
+                concur_active_order.append(request_id)
+                _set_concur_gate(request_id, True)
+                _submit_admitted_request(entry)
+                events_writer.write(
+                    {
+                        "ts": now_s(),
+                        "event": "concur_admit",
+                        "policy": scheduling_policy,
+                        "request_id": request_id,
+                        "dataset_request_id": entry.task.get("request_id"),
+                        "benchmark": entry.task.get("benchmark"),
+                        "task_id": entry.task.get("task_id"),
+                        "reason": reason,
+                        "window": int(concur_active_limit),
+                        "window_max": int(concur_window_max),
+                        "active_agents": len(concur_active_agents),
+                        "paused_agents": len(concur_paused_agents),
+                        "backlog": len(backlog),
+                    }
+                )
+
+        def _process_concur_submissions() -> None:
+            nonlocal concur_active_limit
+            nonlocal concur_last_control_mono
+
+            if not use_concur:
+                return
+
+            control_reason = "between_control_ticks"
+            now_mono = time.perf_counter()
+            if (
+                concur_last_control_mono <= 0.0
+                or (now_mono - concur_last_control_mono)
+                >= float(args.concur_control_interval_s)
+            ):
+                old_limit = int(concur_active_limit)
+                kv_stats = _fetch_kv_cache_stats(args.base_url)
+                usage: float | None = None
+                hit_rate: float | None = None
+                control_reason = "telemetry_unavailable"
+                if isinstance(kv_stats, dict):
+                    raw_usage = kv_stats.get("usage")
+                    raw_hit_rate = kv_stats.get("prefix_cache_hit_rate")
+                    if isinstance(raw_usage, (int, float)):
+                        usage = float(raw_usage)
+                        if isinstance(raw_hit_rate, (int, float)):
+                            hit_rate = float(raw_hit_rate)
+                        concur_active_limit, control_reason = _next_concur_window(
+                            old_limit,
+                            usage=usage,
+                            prefix_cache_hit_rate=hit_rate,
+                            window_max=concur_window_max,
+                            additive_increase=int(args.concur_additive_increase),
+                            multiplicative_decrease=float(
+                                args.concur_multiplicative_decrease
+                            ),
+                            util_low=float(args.concur_util_low),
+                            util_high=float(args.concur_util_high),
+                            hit_rate_threshold=float(
+                                args.concur_hit_rate_threshold
+                            ),
+                        )
+                events_writer.write(
+                    {
+                        "ts": now_s(),
+                        "event": "concur_control",
+                        "policy": scheduling_policy,
+                        "reason": control_reason,
+                        "old_window": old_limit,
+                        "window": int(concur_active_limit),
+                        "window_max": int(concur_window_max),
+                        "kv_usage": usage,
+                        "prefix_cache_hit_rate": hit_rate,
+                        "prefix_cache_queries": (
+                            kv_stats.get("prefix_cache_queries")
+                            if isinstance(kv_stats, dict)
+                            else None
+                        ),
+                        "prefix_cache_hits": (
+                            kv_stats.get("prefix_cache_hits")
+                            if isinstance(kv_stats, dict)
+                            else None
+                        ),
+                        "active_agents": len(concur_active_agents),
+                        "paused_agents": len(concur_paused_agents),
+                        "backlog": len(backlog),
+                        "shrink_semantics": "pause_at_next_llm_generation",
+                    }
+                )
+                concur_last_control_mono = now_mono
+
+            _concur_reconcile(control_reason)
 
         def _process_mars_submissions() -> None:
             # External Admission Controller of MARS. Each call polls CPU/tool pressure and GPU KV-cache pressure, updates the external
@@ -1963,7 +2329,7 @@ def main() -> None:
                 )
 
         while True:
-            # Loop to refresh live worker states 
+            # Loop to refresh live worker states
             _poll_runtime_state()
             _periodic_log_progress()
 
@@ -2024,7 +2390,7 @@ def main() -> None:
                     f"benchmark={task.get('benchmark')} task_id={task.get('task_id')}",
                     flush=True,
                 )
-                if use_mars:
+                if use_mars or use_concur:
                     backlog.append(entry)
                 else:
                     _submit_admitted_request(entry)
@@ -2035,6 +2401,8 @@ def main() -> None:
 
             if use_mars:
                 _process_mars_submissions()
+            elif use_concur:
+                _process_concur_submissions()
 
             if next_index >= len(tasks) and not backlog and not futures:
                 run_completed = True
@@ -2059,6 +2427,7 @@ def main() -> None:
                         future_meta=future_meta,
                         live_tool_stats=live_tool_stats,
                         pending_kv_blocks_by_request_id=pending_kv_blocks_by_request_id,
+                        on_completed=(_concur_complete if use_concur else None),
                     ) | set(not_done)
                     continue
 

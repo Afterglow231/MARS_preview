@@ -26,6 +26,20 @@ mars_default_python() {
   printf '%s\n' "${candidate}"
 }
 
+mars_default_openhands_python() {
+  local host_home="$1"
+  local candidate
+  for candidate in \
+    "${host_home}/.venvs/openhands312/bin/python" \
+    "${host_home}/.venvs/openhands313/bin/python"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  printf '%s\n' "${host_home}/.venvs/openhands312/bin/python"
+}
+
 mars_print_vllm_build_help() {
   local mars_dir="$1"
   local python_bin="${2:-python}"
@@ -125,6 +139,38 @@ mars_infer_tp_from_devices() {
   fi
 }
 
+# Print all compute-process PIDs on the selected physical GPUs.  Experiment
+# launchers use this shared, deliberately command-agnostic guard so an
+# unrelated CUDA workload cannot silently degrade only one backend.
+mars_gpu_compute_pids() {
+  local gpu_spec="${1// /}"
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+
+  local raw_pids=""
+  if [[ -n "${gpu_spec}" && "${gpu_spec,,}" != "all" ]]; then
+    local gpu_id
+    IFS=',' read -r -a _mars_gpu_guard_list <<< "${gpu_spec}"
+    for gpu_id in "${_mars_gpu_guard_list[@]}"; do
+      [[ -z "${gpu_id}" ]] && continue
+      raw_pids+="$(
+        nvidia-smi -i "${gpu_id}" \
+          --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null || true
+      )"$'\n'
+    done
+  else
+    raw_pids="$(
+      nvidia-smi --query-compute-apps=pid \
+        --format=csv,noheader,nounits 2>/dev/null || true
+    )"
+  fi
+
+  printf '%s\n' "${raw_pids}" \
+    | awk '{print $1}' \
+    | sed '/^[0-9][0-9]*$/!d' \
+    | sort -nu \
+    | paste -sd, -
+}
+
 mars_merge_additional_config() {
   local python_bin="$1"
   local existing_json="$2"
@@ -153,7 +199,10 @@ mars_wait_for_vllm() {
   local server_pid="${4:-}"
   local log_path="${5:-}"
   local require_kv_stats="${6:-0}"
-  "${python_bin}" - "${base_url}" "${timeout_s}" "${server_pid}" "${log_path}" "${require_kv_stats}" <<'PY'
+  local kv_snapshot_path="${7:-}"
+  "${python_bin}" - "${base_url}" "${timeout_s}" "${server_pid}" "${log_path}" "${require_kv_stats}" "${kv_snapshot_path}" <<'PY'
+import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -166,6 +215,7 @@ timeout_s = float(sys.argv[2])
 server_pid = int(sys.argv[3]) if sys.argv[3].strip() else None
 log_path = Path(sys.argv[4]) if sys.argv[4].strip() else None
 require_kv_stats = sys.argv[5].strip().lower() in {"1", "on", "true", "yes", "y"}
+kv_snapshot_path = Path(sys.argv[6]) if sys.argv[6].strip() else None
 models_url = f"{base_url}/models" if base_url.endswith("/v1") else f"{base_url}/v1/models"
 kv_stats_url = f"{base_url}/kv_cache_stats" if base_url.endswith("/v1") else f"{base_url}/v1/kv_cache_stats"
 deadline = time.time() + timeout_s
@@ -197,12 +247,57 @@ def http_ok(url: str) -> bool:
         last_err = f"{type(exc).__name__}: {exc}"
         return False
 
+def kv_stats_ok(url: str) -> bool:
+    global last_err
+    try:
+        with urlopen(url, timeout=2.0) as resp:
+            raw = resp.read(64 * 1024)
+            if not (200 <= resp.status < 300):
+                last_err = f"KV stats HTTP {resp.status}"
+                return False
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or payload.get("error"):
+            last_err = f"invalid KV stats payload: {payload!r}"
+            return False
+        block_size = int(payload.get("block_size") or 0)
+        num_gpu_blocks = int(payload.get("num_gpu_blocks") or 0)
+        num_free_blocks = int(payload.get("num_free_blocks") or 0)
+        usage = float(payload.get("usage"))
+        if (
+            block_size <= 0
+            or num_gpu_blocks <= 0
+            or num_free_blocks < 0
+            or num_free_blocks > num_gpu_blocks
+            or not math.isfinite(usage)
+            or usage < 0.0
+            or usage > 1.0
+        ):
+            last_err = f"out-of-range KV stats payload: {payload!r}"
+            return False
+        if kv_snapshot_path is not None:
+            kv_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = kv_snapshot_path.with_suffix(kv_snapshot_path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {"captured_at_s": time.time(), "url": url, "stats": payload},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(kv_snapshot_path)
+        return True
+    except Exception as exc:
+        last_err = f"KV stats {type(exc).__name__}: {exc}"
+        return False
+
 while time.time() < deadline:
     if not alive(server_pid):
         detail = f"vLLM server pid {server_pid} exited before readiness probe succeeded."
         tail = log_tail()
         raise SystemExit(detail + (f"\nLast log lines:\n{tail}" if tail else ""))
-    if http_ok(models_url) and (not require_kv_stats or http_ok(kv_stats_url)):
+    if http_ok(models_url) and (not require_kv_stats or kv_stats_ok(kv_stats_url)):
         raise SystemExit(0)
     time.sleep(0.5)
 raise SystemExit(f"Timed out waiting for vLLM server at {models_url}: {last_err}")
